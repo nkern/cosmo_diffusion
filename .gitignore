@@ -1,0 +1,12 @@
+*egg-info
+*/__pycache__
+*/*/__pycache__
+.coverage*
+.DS_Store
+build/*
+coverage.xml
+\.ipynb_checkpoints/
+*.pyc
+dist/*
+docs/_build/*
+cosmo_diffusion/tests/.coverage*
