@@ -1,0 +1,44 @@
+[build-system]
+requires = ['setuptools']
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosmo_diffusion"
+description = "Diffusion models for cosmology"
+authors = [{name="Nicholas Kern"}, {name="Jiaming Pan"}]
+classifiers = [
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "numpy",
+    "scipy",
+    "h5py",
+    "matplotlib",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "coverage",
+]
+docs = [
+    "cosmodiff[dev]",
+    "furo",
+    "nbsphinx",
+    "sphinx>=1.8,<7.2",
+    "myst-nb",
+    "myst_parser",
+]
+
+[project.urls]
+Repository = "https://github.com/nkern/cosmo_diffusion"
+
+[tool.pytest.ini_options]
+addopts = "--cov cosmodiff --cov-config=.coveragerc --cov-report xml:./coverage.xml"
+testpaths = 'cosmodiff/tests'
+filterwarnings = ["ignore::DeprecationWarning"]
+
