@@ -10,3 +10,4 @@ coverage.xml
 dist/*
 docs/_build/*
 cosmo_diffusion/tests/.coverage*
+.claude/*
