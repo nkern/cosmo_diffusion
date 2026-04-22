@@ -9,6 +9,7 @@ from accelerate import Accelerator
 from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
 import time
+import yaml
 
 
 class ArrayDataset(Dataset):
@@ -50,6 +51,110 @@ class ArrayDataset(Dataset):
 		if self.labels is not None:
 			return {"images": sample, "labels": self.labels[idx]}
 		return {"images": sample}
+
+
+def load_data(
+	img_path: str | np.ndarray,
+	img_read_fn: callable,
+	device: str,
+	dtype: torch.dtype,
+	label_path: str | np.ndarray | None = None,
+	label_read_fn: callable | None = None,
+	log: bool = False,
+	minmax: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+	"""Load images and optionally labels into tensors ready for ``ArrayDataset``.
+
+	Both ``img_path`` and ``label_path`` can be either a filepath or a
+	pre-loaded numpy array, allowing the function to be used in pipelines
+	where data is already in memory.
+
+	Args:
+		img_path (str or np.ndarray): Path to the image data file on disk, or
+			a pre-loaded numpy array.
+		img_read_fn (callable): User-provided function that accepts
+			``img_path`` and returns a numpy array of shape ``(N, C, H, W)``.
+			Ignored if ``img_path`` is already a numpy array.
+		device (str): Device to place the image tensor on, e.g. ``"cpu"``
+			or ``"cuda"``.
+		dtype (torch.dtype): Floating point dtype for the image tensor, e.g.
+			``torch.float32``.
+		label_path (str or np.ndarray, optional): Path to the label data file
+			on disk, or a pre-loaded numpy array. Defaults to ``None``.
+		label_read_fn (callable, optional): User-provided function that accepts
+			``label_path`` and returns a numpy array of shape ``(N,)``. Ignored
+			if ``label_path`` is already a numpy array. Defaults to ``None``.
+		log (bool): Apply a log transform to images before normalization.
+			Defaults to ``False``.
+		minmax (bool): Normalize images to ``[-1, 1]`` via min-max scaling.
+			Defaults to ``True``.
+
+	Returns:
+		tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` of
+		shape ``(N, C, H, W)`` on ``device``, and ``labels`` is a LongTensor
+		of shape ``(N,)`` or ``None`` if ``label_path`` was not provided.
+
+	Example::
+
+		import numpy as np
+
+		def read_images(path):
+		    return np.load(path)
+
+		def read_labels(path):
+		    return np.load(path)
+
+		# from filepaths
+		images, labels = load_data(
+		    img_path="images.npy",
+		    img_read_fn=read_images,
+		    label_path="labels.npy",
+		    label_read_fn=read_labels,
+		    device="cpu",
+		    dtype=torch.float32,
+		)
+
+		# from pre-loaded arrays
+		images, labels = load_data(
+		    img_path=my_image_array,
+		    img_read_fn=read_images,
+		    label_path=my_label_array,
+		    label_read_fn=read_labels,
+		    device="cpu",
+		    dtype=torch.float32,
+		)
+	"""
+	# --- images ---------------------------------------------------------
+	if isinstance(img_path, np.ndarray):
+		images = img_path
+	else:
+		images = img_read_fn(img_path)
+
+	images = torch.as_tensor(images, device=device, dtype=dtype)
+
+	# --- labels ---------------------------------------------------------
+	labels = None
+	if label_path is not None:
+		if isinstance(label_path, np.ndarray):
+			labels = label_path
+		else:
+			if label_read_fn is None:
+				raise ValueError(
+					"label_read_fn must be provided when label_path is a filepath."
+				)
+			labels = label_read_fn(label_path)
+
+		labels = torch.as_tensor(labels, dtype=torch.long)
+
+	# --- transforms -----------------------------------------------------
+	if log:
+		images = images.log()
+
+	if minmax:
+		images = images - images.min()
+		images = images / images.max() * 2 - 1.0
+
+	return images, labels
 
 
 def load_checkpoint(ckpt_path: str):
@@ -111,257 +216,143 @@ def load_checkpoint(ckpt_path: str):
 	return model, noise_scheduler, optimizer, lr_scheduler, augmentations
 
 
-def train(
-	dataset,
-	model,
-	*,
-	noise_scheduler=None,           # None → DDPMScheduler(num_train_timesteps=1000)
-	optimizer=None,                 # None → AdamW
-	lr_scheduler=None,              # None → ConstantLR()
-	output_dir: str = "checkpoints",
-	num_epochs: int = 50,
-	batch_size: int = 16,
-	shuffle: bool = True,
-	checkpoint_every_n_epochs: int = 5,
-	mixed_precision: str = "fp16",
-	gradient_accumulation_steps: int = 1,
-	dataloader_num_workers: int = 4,
-	max_grad_norm: float = 1.0,
-	force_cpu: bool = False,
-	verbose: bool = True,
-):
-	"""Train a diffusers diffusion model.
-
-	To resume from a checkpoint, load it first with ``load_checkpoint()`` and
-	pass the returned objects directly into this function. Augmentations are
-	expected to be built into the dataset object directly (e.g. via
-	``ArrayDataset.augmentations``), and are checkpointed automatically if the
-	dataset exposes an ``augmentations`` attribute.
-
-	The model's forward call is dispatched automatically: if the batch contains
-	``"labels"``, they are passed as a keyword argument (for
-	``DiTTransformer2DModel``); otherwise the model is called with positional
-	``hidden_states`` and ``timestep`` arguments only (for ``UNet2DModel`` and
-	similar).
+def minmax_norm(x: torch.Tensor) -> torch.Tensor:
+	"""Normalize a tensor to ``[-1, 1]`` via min-max scaling.
 
 	Args:
-		dataset (torch.utils.data.Dataset): Dataset returning dicts with an
-			``"images"`` key containing tensors in ``[-1, 1]``, and an optional
-			``"labels"`` key (LongTensor of shape ``(batch_size,)``) for
-			class-conditional DiT training. Augmentations should be applied
-			inside the dataset's ``__getitem__``.
-		model (nn.Module): Pre-instantiated diffusers model (e.g.
-			``UNet2DModel``, ``DiTTransformer2DModel``).
-		noise_scheduler (optional): Pre-instantiated diffusers noise scheduler.
-			Defaults to ``DDPMScheduler(num_train_timesteps=1000)``.
-		optimizer (torch.optim.Optimizer, optional): Optimizer for ``model``.
-			Defaults to ``AdamW`` with PyTorch default lr.
-		lr_scheduler (optional): A ``torch.optim.lr_scheduler`` instance.
-			Defaults to ``ConstantLR(factor=1.0, total_iters=0)``, i.e. a
-			fixed learning rate for the entire run.
-		output_dir (str): Root directory for checkpoints and TensorBoard logs.
-			Defaults to ``"checkpoints"``.
-		num_epochs (int): Total number of training epochs. Defaults to ``50``.
-		batch_size (int): Per-device batch size. Defaults to ``16``.
-		shuffle (bool): Shuffle the dataset each epoch. Defaults to ``True``.
-		checkpoint_every_n_epochs (int): Save a checkpoint every this many
-			epochs. A final checkpoint is always saved at the last epoch.
-			Defaults to ``5``.
-		mixed_precision (str): AMP dtype passed to ``Accelerator`` — one of
-			``"no"``, ``"fp16"``, or ``"bf16"``. Defaults to ``"fp16"``.
-		gradient_accumulation_steps (int): Number of gradient accumulation steps
-			before an optimizer update. Defaults to ``1``.
-		dataloader_num_workers (int): Worker processes for the ``DataLoader``.
-			Defaults to ``4``.
-		max_grad_norm (float): Maximum gradient norm for clipping. Defaults to
-			``1.0``.
-		force_cpu (bool): Force the model to the CPU even if CUDA available
-		verbose (bool): Print training progress and checkpoint messages.
-			Defaults to ``True``.
+		x (torch.Tensor): Input tensor of any shape.
 
-	Example:
-		Train a UNet from scratch with all defaults::
-
-			from diffusers import UNet2DModel
-			model = UNet2DModel(sample_size=64, in_channels=3, out_channels=3)
-			train(my_dataset, model)
-
-		Train a class-conditional DiT::
-
-			from diffusers import DiTTransformer2DModel
-			model = DiTTransformer2DModel(
-				num_attention_heads=16,
-				attention_head_dim=72,
-				in_channels=4,
-				sample_size=32,
-				num_embeds_ada_norm=1000,
-			)
-			# dataset must return dicts with "images" and "labels" keys
-			train(my_dataset, model)
-
-		Resume from a checkpoint::
-
-			model, noise_scheduler, optimizer, lr_scheduler, augmentations = (
-				load_checkpoint("checkpoints/checkpoint-epoch-10")
-			)
-			dataset.augmentations = augmentations
-			train(
-				my_dataset,
-				model,
-				noise_scheduler=noise_scheduler,
-				optimizer=optimizer,
-				lr_scheduler=lr_scheduler,
-			)
+	Returns:
+		torch.Tensor: Normalized tensor with values in ``[-1, 1]``.
 	"""
-	# ------------------------------------------------------------------ #
-	# 1.  Defaults                                                         #
-	# ------------------------------------------------------------------ #
-	if noise_scheduler is None:
-		noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+	x = x - x.min()
+	x = x / x.max()
+	return x * 2 - 1
 
-	if optimizer is None:
-		optimizer = torch.optim.AdamW(model.parameters())
 
-	if lr_scheduler is None:
-		lr_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=0)
+def center_scale_norm(x: torch.Tensor, scale: int = 10):
+	"""Center a tensor based on its median, and normalize by its scale
 
-	# ------------------------------------------------------------------ #
-	# 2.  Accelerator                                                      #
-	# ------------------------------------------------------------------ #
-	accelerator = Accelerator(
-		mixed_precision=mixed_precision,
-		gradient_accumulation_steps=gradient_accumulation_steps,
-		log_with="tensorboard",
-		project_dir=os.path.join(output_dir, "logs"),
-		cpu=force_cpu,
+	Args:
+		x (torch.Tensor): Input tensor of any shape.
+		scale (int): Number of standard deviations to scale by
+
+	Returns:
+		torch.Tensor: scaled tensor
+		float: avg
+		float: std
+	"""
+	# center
+	avg = x.median()
+	x -= avg
+
+	# norm
+	std = x.std()
+	x /= std * scale
+
+	return x, avg, std
+
+
+def parse_config_model(config: dict):
+	"""Instantiate model, optimizer, noise_scheduler, and lr_scheduler from a
+	parsed yaml config dict. Any missing keys return ``None``, which will
+	trigger the corresponding default in ``train()``.
+
+	Args:
+		config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
+
+	Returns:
+		tuple: ``(model, optimizer, noise_scheduler, lr_scheduler)`` where any
+		missing component is ``None``.
+
+	Example::
+
+		with open("config.yaml") as f:
+		    config = yaml.safe_load(f)
+
+		model, optimizer, noise_scheduler, lr_scheduler = parse_model(config)
+	"""
+	import torch.optim.lr_scheduler as lr_schedulers
+
+	# --- model ----------------------------------------------------------
+	model = None
+	if "model" in config:
+		model_cls = getattr(diffusers, config["model"]["class"])
+		model = model_cls(**config["model"].get("kwargs", {}))
+
+	# --- optimizer ------------------------------------------------------
+	optimizer = None
+	if "optimizer" in config and model is not None:
+		opt_cls = getattr(torch.optim, config["optimizer"]["class"])
+		optimizer = opt_cls(model.parameters(), **config["optimizer"].get("kwargs", {}))
+
+	# --- noise scheduler ------------------------------------------------
+	noise_scheduler = None
+	if "noise_scheduler" in config:
+		scheduler_cls = getattr(diffusers, config["noise_scheduler"]["class"])
+		noise_scheduler = scheduler_cls(**config["noise_scheduler"].get("kwargs", {}))
+
+	# --- lr scheduler ---------------------------------------------------
+	lr_scheduler = None
+	if "lr_scheduler" in config and optimizer is not None:
+		lr_cls = getattr(lr_schedulers, config["lr_scheduler"]["class"])
+		lr_scheduler = lr_cls(optimizer, **config["lr_scheduler"].get("kwargs", {}))
+
+	return model, optimizer, noise_scheduler, lr_scheduler
+
+
+def parse_config_data(config: dict):
+	"""Load data and build an ``ArrayDataset`` from a parsed yaml config dict.
+
+	Read functions are resolved by name from ``cosmodiff.utils``. Any callable
+	in that module can be referenced by name in the yaml config.
+
+	Args:
+		config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
+
+	Returns:
+		ArrayDataset: Dataset ready to be passed to ``train()``.
+
+	Example::
+
+		with open("config.yaml") as f:
+		    config = yaml.safe_load(f)
+
+		dataset = parse_data(config)
+	"""
+	import cosmodiff.utils as utils_module
+
+	data_cfg = config["data"]
+
+	dtype = getattr(torch, data_cfg.get("dtype", "float32"))
+	device = data_cfg.get("device", "cpu")
+
+	img_read_fn = getattr(utils_module, data_cfg["img_read_fn"])
+
+	label_path = data_cfg.get("label_path", None)
+	label_read_fn = None
+	if "label_read_fn" in data_cfg:
+		label_read_fn = getattr(utils_module, data_cfg["label_read_fn"])
+
+	images, labels = load_data(
+		img_path=data_cfg["img_path"],
+		img_read_fn=img_read_fn,
+		device=device,
+		dtype=dtype,
+		label_path=label_path,
+		label_read_fn=label_read_fn,
+		log=data_cfg.get("log", False),
+		minmax=data_cfg.get("minmax", True),
 	)
 
-	# ------------------------------------------------------------------ #
-	# 3.  DataLoader                                                       #
-	# ------------------------------------------------------------------ #
-	dataloader = DataLoader(
-		dataset,
-		batch_size=batch_size,
-		shuffle=shuffle,
-		num_workers=dataloader_num_workers,
-		pin_memory=True,
-		persistent_workers=dataloader_num_workers > 0,
-	)
+	augmentations = None
+	if "augmentations" in config:
+		from cosmodiff.augment import config_augments
+		augmentations = config_augments(config["augmentations"])
 
-	# ------------------------------------------------------------------ #
-	# 4.  Hand everything to Accelerate                                    #
-	# ------------------------------------------------------------------ #
-	model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-		model, optimizer, dataloader, lr_scheduler
-	)
-	# ------------------------------------------------------------------ #
-	# 5.  Training loop                                                    #
-	# ------------------------------------------------------------------ #
-	os.makedirs(output_dir, exist_ok=True)
-	global_step = 0
+	return ArrayDataset(images, labels=labels, augmentations=augmentations)
 
-	metrics = {
-		"loss": [],
-		"times": [],
-		"epoch_loss": [],
-		"epoch_times": [],
-	}
 
-	for epoch in range(num_epochs):
-		progress = tqdm(
-			dataloader,
-			desc=f"Epoch {epoch}/{num_epochs - 1}",
-			disable=not verbose or not accelerator.is_local_main_process,
-		)
-
-		model.train()
-		epoch_loss = 0.0
-		epoch_time = 0.0
-
-		for batch in progress:
-			images = batch["images"]
-			labels = batch.get("labels", None)
-
-			t0 = time.time()
-
-			with accelerator.accumulate(model):
-				# --- forward diffusion ----------------------------------
-				noise = torch.randn_like(images)
-				timesteps = torch.randint(
-					0,
-					noise_scheduler.config.num_train_timesteps,
-					(images.shape[0],),
-					device=images.device,
-				).long()
-				noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
-
-				# --- predict noise --------------------------------------
-				with accelerator.autocast():
-					if labels is not None:
-						noise_pred = model(
-							noisy_images,
-							timestep=timesteps,
-							class_labels=labels,
-							return_dict=False,
-						)[0]
-					else:
-						noise_pred = model(
-							noisy_images,
-							timesteps,
-							return_dict=False,
-						)[0]
-
-					loss = F.mse_loss(noise_pred, noise)
-
-				# --- backward -------------------------------------------
-				accelerator.backward(loss)
-				if accelerator.sync_gradients:
-					accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-				optimizer.step()
-				lr_scheduler.step()
-				optimizer.zero_grad(set_to_none=True)
-
-			batch_time = time.time() - t0
-			batch_loss = loss.detach().item()
-
-			global_step += 1
-			epoch_loss += batch_loss
-			epoch_time += batch_time
-
-			metrics["loss"].append(batch_loss)
-			metrics["times"].append(batch_time)
-
-			progress.set_postfix(loss=batch_loss, lr=lr_scheduler.get_last_lr()[0])
-
-		avg_loss = epoch_loss / len(dataloader)
-		metrics["epoch_loss"].append(avg_loss)
-		metrics["epoch_times"].append(epoch_time)
-
-		accelerator.log({"train_loss": avg_loss, "epoch": epoch}, step=global_step)
-		if verbose:
-			accelerator.print(f"Epoch {epoch} — avg loss: {avg_loss:.4f}")
-
-		# ---------------------------------------------------------------- #
-		# 6.  Checkpointing                                                 #
-		# ---------------------------------------------------------------- #
-		if (epoch + 1) % checkpoint_every_n_epochs == 0 or epoch == num_epochs - 1:
-			if accelerator.is_main_process:
-				ckpt_save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch}")
-				accelerator.save_state(ckpt_save_path)
-				accelerator.unwrap_model(model).save_pretrained(ckpt_save_path)
-				with open(os.path.join(ckpt_save_path, "optimizer.pkl"), "wb") as f:
-					pickle.dump(optimizer.optimizer, f)
-				with open(os.path.join(ckpt_save_path, "noise_scheduler.pkl"), "wb") as f:
-					pickle.dump(noise_scheduler, f)
-				with open(os.path.join(ckpt_save_path, "lr_scheduler.pkl"), "wb") as f:
-					pickle.dump(lr_scheduler.scheduler, f)
-				if hasattr(dataset, "augmentations") and dataset.augmentations is not None:
-					with open(os.path.join(ckpt_save_path, "augmentations.pkl"), "wb") as f:
-						pickle.dump(dataset.augmentations, f)
-				if verbose:
-					accelerator.print(f"Checkpoint saved → {ckpt_save_path}")
-
-	accelerator.end_training()
-	return metrics
+def npy_read_fn(fname):
+	return np.load(fname), None
 

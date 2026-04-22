@@ -3,7 +3,8 @@ import tempfile
 import numpy as np
 import torch
 from diffusers import UNet2DModel, DDPMScheduler, DiTTransformer2DModel
-from cosmodiff.utils import train, load_checkpoint, ArrayDataset
+from cosmodiff.utils import load_checkpoint, ArrayDataset
+from cosmodiff.optim import train
 from cosmodiff.augment import RandomRoll, RandomFlip
 
 

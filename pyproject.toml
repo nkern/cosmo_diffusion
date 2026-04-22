@@ -42,3 +42,6 @@ addopts = "--cov cosmodiff --cov-config=.coveragerc --cov-report xml:./coverage.
 testpaths = 'cosmodiff/tests'
 filterwarnings = ["ignore::DeprecationWarning"]
 
+[tool.setuptools]
+script-files = ["scripts/cosmodiff_train.py"]
+
