@@ -10,6 +10,7 @@ from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
 import time
 import yaml
+from typing import Optional
 
 
 class ArrayDataset(Dataset):
@@ -59,7 +60,7 @@ def load_data(
 	device: str,
 	dtype: torch.dtype,
 	label_path: str | np.ndarray | None = None,
-	label_read_fn: callable | None = None,
+	label_read_fn: Optional[callable] = None,
 	log: bool = False,
 	minmax: bool = True,
 	two_dim: bool = True,
