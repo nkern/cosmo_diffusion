@@ -25,9 +25,10 @@ def train(
 	checkpoint_every_n_epochs: int = 5,
 	mixed_precision: str = "fp16",
 	gradient_accumulation_steps: int = 1,
-	dataloader_num_workers: int = 4,
+	dataloader_num_workers: int = 0,
 	max_grad_norm: float = 1.0,
 	force_cpu: bool = False,
+	pin_memory: bool = False,
 	verbose: bool = True,
 ):
 	"""Train a diffusers diffusion model.
@@ -72,10 +73,11 @@ def train(
 		gradient_accumulation_steps (int): Number of gradient accumulation steps
 			before an optimizer update. Defaults to ``1``.
 		dataloader_num_workers (int): Worker processes for the ``DataLoader``.
-			Defaults to ``4``.
+			Defaults to ``0``.
 		max_grad_norm (float): Maximum gradient norm for clipping. Defaults to
 			``1.0``.
 		force_cpu (bool): Force the model to the CPU even if CUDA available
+		pin_memory (bool): pin dataset memory if on CPU
 		verbose (bool): Print training progress and checkpoint messages.
 			Defaults to ``True``.
 
@@ -144,7 +146,7 @@ def train(
 		batch_size=batch_size,
 		shuffle=shuffle,
 		num_workers=dataloader_num_workers,
-		pin_memory=True,
+		pin_memory=pin_memory,
 		persistent_workers=dataloader_num_workers > 0,
 	)
 

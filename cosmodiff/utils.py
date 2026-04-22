@@ -58,7 +58,7 @@ class ArrayDataset(Dataset):
 def load_data(
 	img_path: str | np.ndarray,
 	img_read_fn: callable,
-	device: str,
+	device: str | None = None,
 	dtype: torch.dtype,
 	label_path: str | np.ndarray | None = None,
 	label_read_fn: Optional[callable] = None,
@@ -288,11 +288,15 @@ def parse_config_model(config: dict):
 	"""
 	import torch.optim.lr_scheduler as lr_schedulers
 
+	global_cfg = config.get("global", {})
+	device = global_cfg.get("device", "cpu")
+
 	# --- model ----------------------------------------------------------
 	model = None
 	if "model" in config:
 		model_cls = getattr(diffusers, config["model"]["class"])
 		model = model_cls(**config["model"].get("kwargs", {}))
+		model.to(device)
 
 	# --- optimizer ------------------------------------------------------
 	optimizer = None
@@ -338,9 +342,11 @@ def parse_config_data(config: dict):
 	from cosmodiff.utils import ArrayDataset, load_data
 
 	data_cfg = config["data"]
+	global_cfg = config.get("global", {})
 
-	dtype = getattr(torch, data_cfg.get("dtype", "float32"))
-	device = data_cfg.get("device", "cpu")
+	dtype = getattr(torch, global_cfg.get("dtype", "float32"))
+	device = "cpu" if data_cfg.get("keep_on_cpu", False) \
+		else global_cfg.get("device", "cpu")
 
 	img_read_fn = getattr(utils_module, data_cfg["img_read_fn"])
 

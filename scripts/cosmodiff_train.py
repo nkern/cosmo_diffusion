@@ -51,6 +51,7 @@ def main():
 	parser.add_argument("--no_shuffle", action="store_true")
 	parser.add_argument("--verbose", action="store_true", default=None)
 	parser.add_argument("--force_cpu", action="store_true", default=None)
+	parser.add_argument("--pin_memory", action='store_true', default=None)
 	args = parser.parse_args()
 
 	with open(args.config) as f:
@@ -72,6 +73,8 @@ def main():
 		overrides["verbose"] = True
 	if args.force_cpu:
 		overrides["force_cpu"] = True
+	if args.pin_memory:
+		overrides['pin_memory'] = True
 
 	for k, v in overrides.items():
 		if v is not None:

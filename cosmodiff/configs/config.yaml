@@ -1,5 +1,10 @@
 # cosmodiff training config
 
+# --- global ---
+global:
+  device: cpu
+  dtype: float32
+
 # --- io ---
 io:
   output_dir: /path/to/output
@@ -10,12 +15,11 @@ data:
   img_read_fn: npy_read_fn        # any function in cosmodiff.utils
   label_path: /path/to/labels.npy # optional
   label_read_fn: npy_read_fn      # optional
-  device: cpu
-  dtype: float32
   log: false
   minmax: true
   two_dim: true
   zthin: 4
+  keep_on_cpu: false
 
 # --- augmentations ---
 augmentations:
@@ -66,7 +70,6 @@ lr_scheduler:
 
 # --- training ---
 train:
-  output_dir: checkpoints
   num_epochs: 50
   batch_size: 16
   shuffle: true
@@ -77,3 +80,4 @@ train:
   max_grad_norm: 1.0
   verbose: true
   force_cpu: false
+  pin_memory: false
