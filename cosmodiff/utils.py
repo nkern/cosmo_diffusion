@@ -59,7 +59,7 @@ def load_data(
 	img_path: str | np.ndarray,
 	img_read_fn: callable,
 	device: str | None = None,
-	dtype: torch.dtype,
+	dtype: torch.dtype | None = None,
 	label_path: str | np.ndarray | None = None,
 	label_read_fn: Optional[callable] = None,
 	log: bool = False,
