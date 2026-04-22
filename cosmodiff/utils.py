@@ -355,4 +355,3 @@ def parse_config_data(config: dict):
 
 def npy_read_fn(fname):
 	return np.load(fname), None
-

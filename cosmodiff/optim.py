@@ -265,3 +265,32 @@ def train(
 	accelerator.end_training()
 	return metrics
 
+
+def read_logs(output_dir: str) -> dict:
+	"""Extract training metrics from TensorBoard logs produced by ``optim.train()``.
+
+	Args:
+		output_dir (str): Root output directory passed to ``train()``, which
+			contains a ``logs/`` subdirectory with TensorBoard event files.
+
+	Returns:
+		dict: Dictionary with keys ``"epoch_loss"`` and ``"epoch"`` mapping to
+		lists of scalar values in the order they were logged.
+
+	Example::
+
+		metrics = read_logs("checkpoints")
+		print(metrics["epoch_loss"])
+	"""
+	from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+	log_dir = os.path.join(output_dir, "logs")
+	ea = EventAccumulator(log_dir)
+	ea.Reload()
+
+	metrics = {}
+	for tag in ea.Tags()["scalars"]:
+		events = ea.Scalars(tag)
+		metrics[tag] = [e.value for e in events]
+
+	return metrics
