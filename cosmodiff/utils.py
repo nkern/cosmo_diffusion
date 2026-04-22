@@ -364,8 +364,8 @@ def parse_config_data(config: dict):
 
 	augmentations = None
 	if "augmentations" in config:
-		from cosmodiff.augment import config_augments
-		augmentations = config_augments(config["augmentations"])
+		from cosmodiff.augment import config_augmentations
+		augmentations = config_augmentations(config["augmentations"])
 
 	return ArrayDataset(images, labels=labels, augmentations=augmentations)
 
