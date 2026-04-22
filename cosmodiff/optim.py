@@ -8,6 +8,7 @@ from torch.optim.lr_scheduler import ConstantLR
 from accelerate import Accelerator
 from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
+from typing import Callable, Optional
 import time
 
 
@@ -274,3 +275,87 @@ def train(
 
     accelerator.end_training()
     return metrics
+
+
+@torch.no_grad()
+def generate(
+    model: torch.nn.Module,
+    noise_scheduler,
+    batch_size: int = 1,
+    image_shape: tuple[int, ...] = (1, 64, 64),
+    labels: Optional[torch.Tensor] = None,
+    ddim_thinning: Optional[int] = None,
+    renorm: Optional[Callable] = None,
+    device: Optional[torch.device] = None,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Generate a batch of novel images via reverse diffusion.
+
+    Compatible with DDPMScheduler and DDIMScheduler. The number of inference
+    steps defaults to ``noise_scheduler.config.num_train_timesteps``, or can
+    be reduced via ``ddim_thinning`` for faster DDIM sampling.
+
+    Args:
+        model: Trained diffusers model (UNet2DModel or DiTTransformer2DModel).
+        noise_scheduler: Trained scheduler (DDPMScheduler, DDIMScheduler, or
+            any compatible scheduler with ``set_timesteps`` and ``step``).
+        batch_size (int): Number of images to generate.
+        image_shape (tuple): Shape of each image ``(C, H, W)``.
+        labels (array-like, optional): Class indices of length ``batch_size``.
+            Required for class-conditional models (e.g. DiTTransformer2DModel);
+            ignored otherwise.
+        ddim_thinning (int, optional): Thinning factor relative to
+            ``num_train_timesteps``. E.g. ``ddim_thinning=10`` with 1000
+            training steps runs 100 inference steps. Only meaningful with
+            DDIMScheduler; ignored (``None``) for DDPM.
+        renorm (callable, optional): Applied to the output tensor to convert
+            images back to their original range (e.g. inverse of the
+            normalization used at training time).
+        device (torch.device, optional): Target device. Defaults to the model's
+            current device.
+        generator (torch.Generator, optional): RNG for reproducibility.
+
+    Returns:
+        torch.Tensor: Generated images of shape ``(batch_size, C, H, W)``.
+            Range is ``[-1, 1]`` if ``renorm`` is ``None``, otherwise whatever
+            ``renorm`` maps to.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    model.eval()
+    num_train_timesteps = noise_scheduler.config.num_train_timesteps
+    num_inference_steps = num_train_timesteps // ddim_thinning if ddim_thinning is not None else num_train_timesteps
+    noise_scheduler.set_timesteps(num_inference_steps)
+
+    images = torch.randn(
+        (batch_size, *image_shape),
+        device=device,
+        generator=generator,
+    )
+
+    if labels is not None:
+        labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+
+    for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
+        timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+
+        if labels is not None:
+            noise_pred = model(
+                images,
+                timestep=timesteps,
+                class_labels=labels,
+                return_dict=False,
+            )[0]
+        else:
+            noise_pred = model(images, timesteps, return_dict=False)[0]
+
+        step_kwargs = {}
+        if "generator" in noise_scheduler.step.__code__.co_varnames:
+            step_kwargs["generator"] = generator
+        images = noise_scheduler.step(noise_pred, t, images, **step_kwargs).prev_sample
+
+    if renorm is not None:
+        images = renorm(images)
+
+    return images
