@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import ConstantLR
 from accelerate import Accelerator
+import diffusers
 from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
 import time
