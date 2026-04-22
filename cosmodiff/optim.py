@@ -137,6 +137,7 @@ def train(
 		project_dir=os.path.join(output_dir, "logs"),
 		cpu=force_cpu,
 	)
+    accelerator.init_trackers(project_name="cosmodiff")
 
 	# ------------------------------------------------------------------ #
 	# 3.  DataLoader                                                       #
