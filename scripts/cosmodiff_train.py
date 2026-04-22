@@ -80,8 +80,7 @@ def main():
 	output_dir = config["io"]["output_dir"]
 
 	from cosmodiff.optim import train
-	from cosmodiff.utils import load_checkpoint
-	from cosmodiff.config import parse_config_model, parse_config_data
+	from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data
 
 	# --- check for existing checkpoint ----------------------------------
 	latest_ckpt = find_latest_checkpoint(output_dir)
