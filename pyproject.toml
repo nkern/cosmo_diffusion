@@ -17,6 +17,11 @@ dynamic = ["version"]
 [project.optional-dependencies]
 dev = [
     "numpy",
+    "torch",
+    "diffusers",
+    "accelerate",
+    "tqdm",
+    "pyyaml",
     "scipy",
     "h5py",
     "matplotlib",
