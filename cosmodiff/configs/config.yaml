@@ -14,6 +14,8 @@ data:
   dtype: float32
   log: false
   minmax: true
+  two_dim: true
+  zthin: 4
 
 # --- augmentations ---
 augmentations:

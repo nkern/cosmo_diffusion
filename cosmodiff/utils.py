@@ -62,6 +62,8 @@ def load_data(
 	label_read_fn: callable | None = None,
 	log: bool = False,
 	minmax: bool = True,
+	two_dim: bool = True,
+	zthin: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
 	"""Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -69,12 +71,23 @@ def load_data(
 	pre-loaded numpy array, allowing the function to be used in pipelines
 	where data is already in memory.
 
+	Input arrays are assumed to be of shape ``(Nbatch, Nz, Nx, Ny)``.
+
+	If ``two_dim=True``, the z axis is optionally thinned by ``zthin`` and
+	the array is reshaped to ``(Nbatch * Nz, 1, Nx, Ny)``, treating each
+	z-slice as an independent 2D image.
+
+	If ``two_dim=False``, ``zthin`` is ignored and the array is unsqueezed
+	to ``(Nbatch, 1, Nz, Nx, Ny)`` treating each sample as a 3D volume
+	with a single channel.
+
 	Args:
 		img_path (str or np.ndarray): Path to the image data file on disk, or
 			a pre-loaded numpy array.
 		img_read_fn (callable): User-provided function that accepts
-			``img_path`` and returns a numpy array of shape ``(N, C, H, W)``.
-			Ignored if ``img_path`` is already a numpy array.
+			``img_path`` and returns a numpy array of shape
+			``(Nbatch, Nz, Nx, Ny)``. Ignored if ``img_path`` is already a
+			numpy array.
 		device (str): Device to place the image tensor on, e.g. ``"cpu"``
 			or ``"cuda"``.
 		dtype (torch.dtype): Floating point dtype for the image tensor, e.g.
@@ -88,11 +101,17 @@ def load_data(
 			Defaults to ``False``.
 		minmax (bool): Normalize images to ``[-1, 1]`` via min-max scaling.
 			Defaults to ``True``.
+		two_dim (bool): If ``True``, reshape the data to treat each z-slice
+			as an independent 2D image. If ``False``, treat each sample as a
+			3D volume. Defaults to ``True``.
+		zthin (int): Thinning factor along the z axis, applied before
+			reshaping when ``two_dim=True``. A value of ``1`` applies no
+			thinning. Defaults to ``1``.
 
 	Returns:
-		tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` of
-		shape ``(N, C, H, W)`` on ``device``, and ``labels`` is a LongTensor
-		of shape ``(N,)`` or ``None`` if ``label_path`` was not provided.
+		tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` on
+		``device``, and ``labels`` is a LongTensor of shape ``(N,)`` or
+		``None`` if ``label_path`` was not provided.
 
 	Example::
 
@@ -101,27 +120,13 @@ def load_data(
 		def read_images(path):
 		    return np.load(path)
 
-		def read_labels(path):
-		    return np.load(path)
-
-		# from filepaths
 		images, labels = load_data(
 		    img_path="images.npy",
 		    img_read_fn=read_images,
-		    label_path="labels.npy",
-		    label_read_fn=read_labels,
 		    device="cpu",
 		    dtype=torch.float32,
-		)
-
-		# from pre-loaded arrays
-		images, labels = load_data(
-		    img_path=my_image_array,
-		    img_read_fn=read_images,
-		    label_path=my_label_array,
-		    label_read_fn=read_labels,
-		    device="cpu",
-		    dtype=torch.float32,
+		    two_dim=True,
+		    zthin=4,
 		)
 	"""
 	# --- images ---------------------------------------------------------
@@ -153,6 +158,13 @@ def load_data(
 	if minmax:
 		images = images - images.min()
 		images = images / images.max() * 2 - 1.0
+
+	# --- reshape --------------------------------------------------------
+	if two_dim:
+		images = images[:, ::zthin]
+		images = images.reshape(-1, 1, *images.shape[-2:])
+	else:
+		images = images.unsqueeze(1)
 
 	return images, labels
 
@@ -318,9 +330,10 @@ def parse_config_data(config: dict):
 		with open("config.yaml") as f:
 		    config = yaml.safe_load(f)
 
-		dataset = parse_data(config)
+		dataset = parse_config_data(config)
 	"""
 	import cosmodiff.utils as utils_module
+	from cosmodiff.utils import ArrayDataset, load_data
 
 	data_cfg = config["data"]
 
@@ -343,6 +356,8 @@ def parse_config_data(config: dict):
 		label_read_fn=label_read_fn,
 		log=data_cfg.get("log", False),
 		minmax=data_cfg.get("minmax", True),
+		two_dim=data_cfg.get("two_dim", True),
+		zthin=data_cfg.get("zthin", 1),
 	)
 
 	augmentations = None
