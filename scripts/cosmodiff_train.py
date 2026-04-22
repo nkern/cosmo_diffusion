@@ -83,7 +83,7 @@ def main():
 	output_dir = config["io"]["output_dir"]
 
 	from cosmodiff.optim import train
-	from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data
+	from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data, write_metrics
 
 	# --- check for existing checkpoint ----------------------------------
 	latest_ckpt = find_latest_checkpoint(output_dir)
@@ -116,6 +116,11 @@ def main():
 	print(f"Final epoch loss: {metrics['epoch_loss'][-1]:.4f}")
 	print(f"Total time: {sum(metrics['epoch_times']):.1f}s")
 
+    metrics_path = os.path.join(
+        output_dir, "metrics_epoch_{}.json".format(len(metrics["epoch_loss"]) - 1)
+    )
+    write_metrics(metrics, metrics_path)
+    print(f"Metrics written to {metrics_path}")
 
 if __name__ == "__main__":
 	main()

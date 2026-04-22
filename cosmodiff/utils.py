@@ -378,3 +378,163 @@ def parse_config_data(config: dict):
 
 def npy_read_fn(fname):
     return np.load(fname)
+
+
+def read_logs(output_dir: str) -> dict:
+    """Extract training metrics from TensorBoard logs produced by ``optim.train()``.
+
+    Args:
+        output_dir (str): Root output directory passed to ``train()``, which
+            contains a ``logs/`` subdirectory with TensorBoard event files.
+
+    Returns:
+        dict: Dictionary with keys ``"epoch_loss"`` and ``"epoch"`` mapping to
+        lists of scalar values in the order they were logged.
+
+    Example::
+
+        metrics = read_logs("checkpoints")
+        print(metrics["epoch_loss"])
+    """
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    log_dir = os.path.join(output_dir, "logs")
+    ea = EventAccumulator(log_dir)
+    ea.Reload()
+
+    metrics = {}
+    for tag in ea.Tags()["scalars"]:
+        events = ea.Scalars(tag)
+        metrics[tag] = [e.value for e in events]
+
+    return metrics
+
+
+def write_metrics(metrics: dict, filepath: str) -> None:
+    """Write a training metrics dictionary to a JSON file.
+
+    Args:
+        metrics (dict): Metrics dictionary returned by ``train()``.
+        filepath (str): Path to the output JSON file.
+
+    Example::
+
+        write_metrics(metrics, "output/metrics_50.json")
+    """
+    import json
+    with open(filepath, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+
+def read_metrics(filepath: str) -> dict:
+    """Read a training metrics dictionary from a JSON file.
+
+    Args:
+        filepath (str): Path to a JSON file produced by ``write_metrics()``.
+
+    Returns:
+        dict: Metrics dictionary with keys ``"loss"``, ``"times"``,
+        ``"epoch_loss"``, ``"epoch_times"``, ``"epoch_lr"``.
+
+    Example::
+
+        metrics = read_metrics("output/metrics_50.json")
+    """
+    import json
+    with open(filepath) as f:
+        return json.load(f)
+
+
+def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) -> None:
+    """Plot training metrics from a dictionary or JSON file produced by
+    ``write_metrics()``.
+
+    Produces four plots:
+        - Batch loss over training steps
+        - Epoch loss over epochs
+        - Learning rate over epochs
+        - Epoch wall time
+
+    matplotlib is imported lazily inside this function so it is not a strict
+    dependency of cosmodiff. If plotting on a remote server with no display,
+    use ``save_dir`` and set ``show=False``.
+
+    Args:
+        metrics (dict or str): Metrics dictionary returned by ``train()``, or
+            a path to a JSON file produced by ``write_metrics()``.
+        save_dir (str, optional): Directory to save plots. If ``None``, plots
+            are not saved to disk. Defaults to ``None``.
+        show (bool): Whether to call ``plt.show()`` after each plot. Useful in
+            interactive sessions. Defaults to ``False``.
+
+    Example::
+
+        # from dict
+        metrics = train(dataset, model)
+        plot_metrics(metrics, show=True)
+
+        # from file
+        plot_metrics("output/metrics_epoch_49.json", save_dir="output/plots")
+    """
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if isinstance(metrics, str):
+        metrics = read_metrics(metrics)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
+    # --- batch loss -----------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(metrics["loss"], alpha=0.7)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_title("Batch Loss")
+    fig.tight_layout()
+    if save_dir is not None:
+        fig.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # --- epoch loss -----------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(metrics["epoch_loss"], marker="o")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Epoch Loss")
+    fig.tight_layout()
+    if save_dir is not None:
+        fig.savefig(os.path.join(save_dir, "epoch_loss.png"), dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # --- learning rate --------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(metrics["epoch_lr"], marker="o")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning Rate")
+    ax.set_title("Learning Rate Schedule")
+    fig.tight_layout()
+    if save_dir is not None:
+        fig.savefig(os.path.join(save_dir, "learning_rate.png"), dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # --- epoch times ----------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(metrics["epoch_times"], marker="o")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Time (s)")
+    ax.set_title("Epoch Wall Time")
+    fig.tight_layout()
+    if save_dir is not None:
+        fig.savefig(os.path.join(save_dir, "epoch_times.png"), dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)

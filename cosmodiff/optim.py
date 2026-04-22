@@ -168,6 +168,7 @@ def train(
         "times": [],
         "epoch_loss": [],
         "epoch_times": [],
+        "epoch_lr": [],
     }
 
     for epoch in range(num_epochs):
@@ -222,9 +223,9 @@ def train(
                     accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
 
                 optimizer.step()
-                lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+            lr_scheduler.step()
             batch_time = time.time() - t0
             batch_loss = loss.detach().item()
 
@@ -240,8 +241,14 @@ def train(
         avg_loss = epoch_loss / len(dataloader)
         metrics["epoch_loss"].append(avg_loss)
         metrics["epoch_times"].append(epoch_time)
+        metrics['epoch_lr'].append(lr_scheduler.get_last_lr()[0])
 
-        accelerator.log({"train_loss": avg_loss, "epoch": epoch}, step=global_step)
+        accelerator.log({
+            "train_loss": avg_loss,
+            "epoch": epoch,
+            "epoch_time": epoch_time,
+            "learning_rate": lr_scheduler.get_last_lr()[0],
+        }, step=global_step)
         if verbose:
             accelerator.print(f"Epoch {epoch} — avg loss: {avg_loss:.4f}")
 
@@ -266,34 +273,4 @@ def train(
                     accelerator.print(f"Checkpoint saved → {ckpt_save_path}")
 
     accelerator.end_training()
-    return metrics
-
-
-def read_logs(output_dir: str) -> dict:
-    """Extract training metrics from TensorBoard logs produced by ``optim.train()``.
-
-    Args:
-        output_dir (str): Root output directory passed to ``train()``, which
-            contains a ``logs/`` subdirectory with TensorBoard event files.
-
-    Returns:
-        dict: Dictionary with keys ``"epoch_loss"`` and ``"epoch"`` mapping to
-        lists of scalar values in the order they were logged.
-
-    Example::
-
-        metrics = read_logs("checkpoints")
-        print(metrics["epoch_loss"])
-    """
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-    log_dir = os.path.join(output_dir, "logs")
-    ea = EventAccumulator(log_dir)
-    ea.Reload()
-
-    metrics = {}
-    for tag in ea.Tags()["scalars"]:
-        events = ea.Scalars(tag)
-        metrics[tag] = [e.value for e in events]
-
     return metrics
