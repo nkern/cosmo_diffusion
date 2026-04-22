@@ -3,7 +3,7 @@ requires = ['setuptools']
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cosmo_diffusion"
+name = "cosmodiff"
 description = "Diffusion models for cosmology"
 authors = [{name="Nicholas Kern"}, {name="Jiaming Pan"}]
 classifiers = [
