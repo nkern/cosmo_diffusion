@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from diffusers import UNet2DModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
 from cosmodiff.utils import load_checkpoint, ArrayDataset
-from cosmodiff.optim import train, generate
+from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
 from cosmodiff.augment import RandomRoll, RandomFlip
 
 
@@ -222,6 +222,78 @@ def test_generate_reproducible():
     out2 = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), generator=g2)
 
     assert torch.allclose(out1, out2)
+
+
+# ------------------------------------------------------------------ #
+# Helpers for FID / KID tests                                         #
+# ------------------------------------------------------------------ #
+
+
+def _make_features(n: int, seed: int, mean: float = 0.0, std: float = 1.0):
+    torch.manual_seed(seed)
+    return (torch.randn(n, 1, 16, 16) * std + mean).double()
+
+
+# ------------------------------------------------------------------ #
+# FID tests                                                            #
+# ------------------------------------------------------------------ #
+
+def test_fid_finite_and_nonneg():
+    """FID is finite and non-negative."""
+    train_imgs = _make_features(500, seed=0)
+    fake_imgs  = _make_features(500, seed=1)
+    encode = build_pca_encoder(train_imgs, rank=16)
+    fid = compute_fid(encode(train_imgs), encode(fake_imgs))
+    assert torch.isfinite(torch.tensor(fid))
+    assert fid >= 0.0
+
+
+def test_fid_smaller_same_dist():
+    """FID is smaller when fake comes from the same distribution vs a shifted one."""
+    torch.manual_seed(0)
+    train_imgs = torch.randn(500, 1, 16, 16).double()
+    encode = build_pca_encoder(train_imgs, rank=16)
+    feats_real = encode(train_imgs)
+
+    torch.manual_seed(1)
+    feats_same = encode(torch.randn(500, 1, 16, 16).double())
+
+    torch.manual_seed(2)
+    feats_diff = encode((torch.randn(500, 1, 16, 16) * 3 + 5).double())
+
+    assert compute_fid(feats_real, feats_same) < compute_fid(feats_real, feats_diff)
+
+
+# ------------------------------------------------------------------ #
+# KID tests                                                            #
+# ------------------------------------------------------------------ #
+
+def test_kid_finite_and_nonneg():
+    """KID mean is finite; std is non-negative."""
+    train_imgs = _make_features(500, seed=0)
+    fake_imgs  = _make_features(500, seed=1)
+    encode = build_pca_encoder(train_imgs, rank=16)
+    mean_kid, std_kid = compute_kid(encode(train_imgs), encode(fake_imgs), subset_size=200, n_subsets=5)
+    assert torch.isfinite(torch.tensor(mean_kid))
+    assert std_kid >= 0.0
+
+
+def test_kid_smaller_same_dist():
+    """KID mean is smaller when fake comes from the same distribution vs a shifted one."""
+    torch.manual_seed(0)
+    train_imgs = torch.randn(500, 1, 16, 16).double()
+    encode = build_pca_encoder(train_imgs, rank=16)
+    feats_real = encode(train_imgs)
+
+    torch.manual_seed(1)
+    feats_same = encode(torch.randn(500, 1, 16, 16).double())
+
+    torch.manual_seed(2)
+    feats_diff = encode((torch.randn(500, 1, 16, 16) * 3 + 5).double())
+
+    kid_same, _ = compute_kid(feats_real, feats_same, subset_size=200, n_subsets=5)
+    kid_diff, _ = compute_kid(feats_real, feats_diff, subset_size=200, n_subsets=5)
+    assert kid_same < kid_diff
 
 
 
