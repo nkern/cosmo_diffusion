@@ -39,7 +39,10 @@ class ArrayDataset(Dataset):
             # {"images": tensor, "labels": tensor}
     """
     def __init__(self, arrays: torch.Tensor, labels: torch.Tensor = None, augmentations: callable = None):
-        self.arrays = arrays
+        # CUDA tensors cannot be shared across DataLoader worker processes (fork
+        # cannot inherit the CUDA context). Move to CPU; the training loop
+        # (via accelerate) handles GPU placement per-batch.
+        self.arrays = arrays.cpu()
         self.labels = labels
         self.augmentations = augmentations
 
