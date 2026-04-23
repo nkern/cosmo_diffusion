@@ -14,24 +14,6 @@ import torch
 import yaml
 
 
-def find_latest_checkpoint(output_dir: str) -> str | None:
-    """Return the path to the latest checkpoint in ``output_dir``, or ``None``
-    if no checkpoints exist.
-
-    Args:
-        output_dir (str): Directory to search for checkpoints.
-
-    Returns:
-        str or None: Path to the latest checkpoint directory.
-    """
-    pattern = os.path.join(output_dir, "checkpoint-epoch-*")
-    checkpoints = sorted(
-        glob.glob(pattern),
-        key=lambda p: int(p.split("-")[-1]),
-    )
-    return checkpoints[-1] if checkpoints else None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Train a cosmodiff diffusion model.")
     parser.add_argument(
@@ -83,7 +65,7 @@ def main():
     output_dir = config["io"]["output_dir"]
 
     from cosmodiff.optim import train
-    from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data, write_metrics
+    from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data, write_metrics, find_latest_checkpoint
 
     # --- check for existing checkpoint ----------------------------------
     latest_ckpt = find_latest_checkpoint(output_dir)

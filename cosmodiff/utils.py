@@ -1,4 +1,5 @@
 import os
+import glob
 import pickle
 import numpy as np
 import torch
@@ -556,3 +557,21 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     if show:
         plt.show()
     plt.close(fig)
+
+
+def find_latest_checkpoint(output_dir: str) -> str | None:
+    """Return the path to the latest checkpoint in ``output_dir``, or ``None``
+    if no checkpoints exist.
+
+    Args:
+        output_dir (str): Directory to search for checkpoints.
+
+    Returns:
+        str or None: Path to the latest checkpoint directory.
+    """
+    pattern = os.path.join(output_dir, "checkpoint-epoch-*")
+    checkpoints = sorted(
+        glob.glob(pattern),
+        key=lambda p: int(p.split("-")[-1]),
+    )
+    return checkpoints[-1] if checkpoints else None

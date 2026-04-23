@@ -20,7 +20,7 @@ data:
   two_dim: true
   zthin: 4
   n_samples: null
-  rng: null
+  seed: null
   keep_on_cpu: false
 
 # --- augmentations ---
