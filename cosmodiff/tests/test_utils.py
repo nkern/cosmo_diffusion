@@ -36,6 +36,28 @@ def test_n_samples():
         assert any(torch.allclose(images[i], arr_t[j]) for j in range(len(arr_t)))
 
 
+def test_n_samples_labels_in_sync():
+    """Labels must be subsampled with the same indices as images."""
+    rng = np.random.default_rng(0)
+    arr = rng.random((20, 4, 8, 8)).astype(np.float32)
+    # labels encode each sample's original row index so we can verify alignment
+    labels = np.arange(20)
+
+    images, out_labels = load_data(
+        arr, img_read_fn=None,
+        label_path=labels, label_read_fn=None,
+        n_samples=7, seed=0,
+        minmax=False, two_dim=False,
+    )
+    assert images.shape[0] == 7
+    assert out_labels.shape[0] == 7
+
+    arr_t = torch.as_tensor(arr)
+    for img, lbl in zip(images, out_labels):
+        # the label is the original index; confirm the image matches that row
+        assert torch.allclose(img, arr_t[lbl.item()])
+
+
 def test_seed():
     arr = _make_array(n=50)
     imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, minmax=False, two_dim=False)

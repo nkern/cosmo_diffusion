@@ -168,6 +168,11 @@ def load_data(
                 )
             labels = label_read_fn(label_path)
 
+        if n_samples is not None:
+            labels = labels[idx]
+        else:
+            labels = labels[:]
+
         labels = torch.as_tensor(labels, dtype=torch.long)
 
     # --- transforms -----------------------------------------------------
@@ -372,20 +377,46 @@ def parse_config_data(config: dict):
     if "label_read_fn" in data_cfg:
         label_read_fn = getattr(utils_module, data_cfg["label_read_fn"])
 
-    images, labels = load_data(
-        img_path=data_cfg["img_path"],
+    img_path = data_cfg["img_path"]
+    n_samples = data_cfg.get("n_samples", None)
+    seed = data_cfg.get("seed", None)
+    log = data_cfg.get("log", False)
+
+    _load_kwargs = dict(
         img_read_fn=img_read_fn,
         device=device,
         dtype=dtype,
-        label_path=label_path,
         label_read_fn=label_read_fn,
-        log=data_cfg.get("log", False),
         minmax=data_cfg.get("minmax", True),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
-        n_samples=data_cfg.get("n_samples", None),
-        seed=data_cfg.get("seed", None),
     )
+
+    if isinstance(img_path, (list, tuple)):
+        n = len(img_path)
+        label_paths = label_path if isinstance(label_path, (list, tuple)) else [label_path] * n
+        n_samples_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
+        seeds_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
+        log_list = log if isinstance(log, (list, tuple)) else [log] * n
+
+        all_images, all_labels = [], []
+        for p, lp, ns, sd, lg in zip(img_path, label_paths, n_samples_list, seeds_list, log_list):
+            imgs, lbls = load_data(img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, **_load_kwargs)
+            all_images.append(imgs)
+            if lbls is not None:
+                all_labels.append(lbls)
+
+        images = torch.cat(all_images, dim=0)
+        labels = torch.cat(all_labels, dim=0) if all_labels else None
+    else:
+        images, labels = load_data(
+            img_path=img_path,
+            label_path=label_path,
+            n_samples=n_samples,
+            seed=seed,
+            log=log,
+            **_load_kwargs,
+        )
 
     augmentations = None
     if "augmentations" in config:
