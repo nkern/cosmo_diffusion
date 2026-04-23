@@ -99,7 +99,7 @@ def main():
     print(f"Total time: {sum(metrics['epoch_times']):.1f}s")
 
     metrics_path = os.path.join(
-        output_dir, "metrics_epoch_{}.json".format(len(metrics["epoch_loss"]) - 1)
+        output_dir, "metrics_epoch_{:04d}.json".format(len(metrics["epoch_loss"]) - 1)
     )
     write_metrics(metrics, metrics_path)
     print(f"Metrics written to {metrics_path}")
