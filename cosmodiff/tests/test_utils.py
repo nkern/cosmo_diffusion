@@ -20,7 +20,7 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 
 
 # ---------------------------------------------------------------------------
-# load_data: n_samples / rng / memmap
+# load_data: n_samples / seed / memmap
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
@@ -36,11 +36,11 @@ def test_n_samples():
         assert any(torch.allclose(images[i], arr_t[j]) for j in range(len(arr_t)))
 
 
-def test_rng():
+def test_seed():
     arr = _make_array(n=50)
-    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, rng=np.random.default_rng(42), minmax=False, two_dim=False)
-    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, rng=np.random.default_rng(42), minmax=False, two_dim=False)
-    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, rng=np.random.default_rng(99), minmax=False, two_dim=False)
+    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, minmax=False, two_dim=False)
+    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, minmax=False, two_dim=False)
+    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=99, minmax=False, two_dim=False)
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 

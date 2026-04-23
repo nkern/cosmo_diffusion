@@ -70,7 +70,7 @@ def load_data(
     two_dim: bool = True,
     zthin: int = 1,
     n_samples: int | None = None,
-    rng: np.random.Generator | None = None,
+    seed: np.random.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -143,8 +143,11 @@ def load_data(
         images = img_read_fn(img_path)
 
     if n_samples is not None:
-        _rng = rng if rng is not None else np.random.default_rng()
-        idx = _rng.choice(len(images), size=n_samples, replace=False)
+        if seed is None:
+            idx = slice(n_samples)
+        else:
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(images), size=n_samples, replace=False)
         images = images[idx]
     else:
         # images may be a memory-mapped array, so slice to instantiate it
@@ -380,7 +383,7 @@ def parse_config_data(config: dict):
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
         n_samples=data_cfg.get("n_samples", None),
-        rng=data_cfg.get("rng", None),
+        seed=data_cfg.get("seed", None),
     )
 
     augmentations = None
