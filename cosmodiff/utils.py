@@ -575,3 +575,9 @@ def find_latest_checkpoint(output_dir: str) -> str | None:
         key=lambda p: int(p.split("-")[-1]),
     )
     return checkpoints[-1] if checkpoints else None
+
+
+def read_config(path):
+    with open(path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
