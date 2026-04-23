@@ -376,6 +376,8 @@ def parse_config_data(config: dict):
         minmax=data_cfg.get("minmax", True),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
+        n_samples=data_cfg.get("n_samples", None),
+        rng=data_cfg.get("rng", None),
     )
 
     augmentations = None
