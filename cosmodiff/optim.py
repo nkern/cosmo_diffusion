@@ -11,6 +11,8 @@ from tqdm.auto import tqdm
 from typing import Callable, Optional
 import time
 
+from . import utils
+
 
 def train(
     dataset,
@@ -258,7 +260,7 @@ def train(
         # ---------------------------------------------------------------- #
         if (epoch + 1) % checkpoint_every_n_epochs == 0 or epoch == num_epochs - 1:
             if accelerator.is_main_process:
-                ckpt_save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch}")
+                ckpt_save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch:04d}")
                 accelerator.save_state(ckpt_save_path)
                 accelerator.unwrap_model(model).save_pretrained(ckpt_save_path)
                 with open(os.path.join(ckpt_save_path, "optimizer.pkl"), "wb") as f:
@@ -270,6 +272,10 @@ def train(
                 if hasattr(dataset, "augmentations") and dataset.augmentations is not None:
                     with open(os.path.join(ckpt_save_path, "augmentations.pkl"), "wb") as f:
                         pickle.dump(dataset.augmentations, f)
+
+                metrics_path = os.path.join(ckpt_save_path, "metrics.json")
+                utils.write_metrics(metrics, metrics_path)
+
                 if verbose:
                     accelerator.print(f"Checkpoint saved → {ckpt_save_path}")
 

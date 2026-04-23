@@ -40,12 +40,13 @@ def test_train_basic():
             verbose=False,
         )
 
-        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-1")
+        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
         assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
         assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
@@ -118,12 +119,13 @@ def test_train_conditional_dit():
             verbose=False,
         )
 
-        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-1")
+        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
         assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
         assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
