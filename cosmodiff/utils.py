@@ -543,6 +543,7 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     ax.set_title("Batch Loss")
+    ax.set_yscale('log')
     fig.tight_layout()
     if save_dir is not None:
         fig.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
