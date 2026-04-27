@@ -8,6 +8,7 @@ Usage:
 
 import os
 import glob
+import shutil
 import argparse
 import numpy as np
 import torch
@@ -63,6 +64,11 @@ def main():
             config["train"][k] = v
 
     output_dir = config["io"]["output_dir"]
+
+    os.makedirs(output_dir, exist_ok=True)
+    config_dest = os.path.join(output_dir, os.path.basename(args.config))
+    if not os.path.exists(config_dest):
+        shutil.copy2(args.config, config_dest)
 
     from cosmodiff.optim import train
     from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data, write_metrics, find_latest_checkpoint
