@@ -1,6 +1,8 @@
 import os
 import glob
 import pickle
+import importlib
+import inspect
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -195,17 +197,32 @@ def load_data(
     return images, labels
 
 
+def _import_class(qualified_name: str):
+    module_name, class_name = qualified_name.rsplit(".", 1)
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+def _get_lr_scheduler_kwargs(scheduler) -> dict:
+    sig = inspect.signature(scheduler.__class__.__init__)
+    kwargs = {}
+    for name in sig.parameters:
+        if name in ("self", "optimizer", "last_epoch", "verbose"):
+            continue
+        if hasattr(scheduler, name):
+            kwargs[name] = getattr(scheduler, name)
+    return kwargs
+
+
 def load_checkpoint(ckpt_path: str):
     """Reconstruct model, noise_scheduler, optimizer, lr_scheduler, and
     optionally an augmentation pipeline from a saved checkpoint directory
     produced by ``train()``.
 
-    All objects are returned fully reconstructed and ready to be passed
-    directly into ``train()``. The lr_scheduler and noise_scheduler are
-    stored as pickles so no knowledge of the original class is required.
-    The augmentation pipeline is restored from ``augmentations.pt`` if
-    present in the checkpoint directory and should be re-attached to the
-    dataset before passing it to ``train()``.
+    The returned objects are freshly constructed from the checkpoint config
+    and are ready to be passed directly into ``train()``.  Pass
+    ``resume_from_checkpoint=ckpt_path`` to ``train()`` so it can call
+    ``accelerator.load_state()`` after ``accelerator.prepare()`` to restore
+    optimizer moments, the grad scaler, and RNG state.
 
     Args:
         ckpt_path (str): Path to a checkpoint directory produced by ``train()``.
@@ -216,33 +233,34 @@ def load_checkpoint(ckpt_path: str):
         saved in the checkpoint.
 
     Example:
-        Resume without augmentations::
-
-            model, noise_scheduler, optimizer, lr_scheduler, _ = load_checkpoint(
-                "checkpoints/checkpoint-epoch-10"
-            )
-            train(my_dataset, model, noise_scheduler=noise_scheduler,
-                optimizer=optimizer, lr_scheduler=lr_scheduler)
-
-        Resume with augmentations::
+        Resume training::
 
             model, noise_scheduler, optimizer, lr_scheduler, augmentations = (
                 load_checkpoint("checkpoints/checkpoint-epoch-10")
             )
-            dataset.augmentations = augmentations
-            train(my_dataset, model, noise_scheduler=noise_scheduler,
-                optimizer=optimizer, lr_scheduler=lr_scheduler)
+            if augmentations is not None:
+                dataset.augmentations = augmentations
+            train(
+                my_dataset, model,
+                noise_scheduler=noise_scheduler,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                resume_from_checkpoint="checkpoints/checkpoint-epoch-10",
+            )
     """
     model = AutoModel.from_pretrained(ckpt_path)
 
-    with open(os.path.join(ckpt_path, "noise_scheduler.pkl"), "rb") as f:
-        noise_scheduler = pickle.load(f)
+    with open(os.path.join(ckpt_path, "checkpoint_config.yaml")) as f:
+        cfg = yaml.safe_load(f)
 
-    with open(os.path.join(ckpt_path, "optimizer.pkl"), "rb") as f:
-        optimizer = pickle.load(f)
+    noise_scheduler_cls = _import_class(cfg["noise_scheduler"]["class"])
+    noise_scheduler = noise_scheduler_cls.from_pretrained(ckpt_path)
 
-    with open(os.path.join(ckpt_path, "lr_scheduler.pkl"), "rb") as f:
-        lr_scheduler = pickle.load(f)
+    optimizer_cls = _import_class(cfg["optimizer"]["class"])
+    optimizer = optimizer_cls(model.parameters())
+
+    lr_scheduler_cls = _import_class(cfg["lr_scheduler"]["class"])
+    lr_scheduler = lr_scheduler_cls(optimizer, **cfg["lr_scheduler"]["kwargs"])
 
     augmentations_path = os.path.join(ckpt_path, "augmentations.pkl")
     if os.path.exists(augmentations_path):

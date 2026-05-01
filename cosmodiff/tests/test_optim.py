@@ -42,9 +42,9 @@ def test_train_basic():
 
         ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
-        assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "scheduler_config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "checkpoint_config.yaml"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
@@ -121,9 +121,9 @@ def test_train_conditional_dit():
 
         ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
-        assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "scheduler_config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "checkpoint_config.yaml"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 

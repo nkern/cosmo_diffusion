@@ -71,34 +71,32 @@ def main():
         shutil.copy2(args.config, config_dest)
 
     from cosmodiff.optim import train
-    from cosmodiff.utils import load_checkpoint, parse_config_model, parse_config_data, write_metrics, find_latest_checkpoint
+    from cosmodiff.utils import parse_config_model, parse_config_data, write_metrics, find_latest_checkpoint
 
     # --- check for existing checkpoint ----------------------------------
     latest_ckpt = find_latest_checkpoint(output_dir)
+    dataset = parse_config_data(config)
 
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
-        model, noise_scheduler, optimizer, lr_scheduler, augmentations = (
-            load_checkpoint(latest_ckpt)
+        metrics = train(
+            dataset,
+            resume_from_checkpoint=latest_ckpt,
+            output_dir=output_dir,
+            **config["train"],
         )
-        dataset = parse_config_data(config)
-        if augmentations is not None:
-            dataset.augmentations = augmentations
-
     else:
         print("No checkpoint found, training from scratch.")
         model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
-        dataset = parse_config_data(config)
-
-    metrics = train(
-        dataset,
-        model,
-        optimizer=optimizer,
-        noise_scheduler=noise_scheduler,
-        lr_scheduler=lr_scheduler,
-        output_dir=output_dir,
-        **config["train"],
-    )
+        metrics = train(
+            dataset,
+            model,
+            optimizer=optimizer,
+            noise_scheduler=noise_scheduler,
+            lr_scheduler=lr_scheduler,
+            output_dir=output_dir,
+            **config["train"],
+        )
 
     print(f"Training complete.")
     print(f"Final epoch loss: {metrics['epoch_loss'][-1]:.4f}")

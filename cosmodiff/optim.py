@@ -1,5 +1,6 @@
 import os
 import pickle
+import yaml
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,14 +15,24 @@ import time
 from . import utils
 
 
+def _to_yaml_safe(obj):
+    """Recursively convert tuples to lists so yaml.safe_load can round-trip."""
+    if isinstance(obj, dict):
+        return {k: _to_yaml_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_yaml_safe(v) for v in obj]
+    return obj
+
+
 def train(
     dataset,
-    model,
+    model=None,
     *,
     noise_scheduler=None,           # None → DDPMScheduler(num_train_timesteps=1000)
     optimizer=None,                 # None → AdamW
     lr_scheduler=None,              # None → ConstantLR()
     output_dir: str = "checkpoints",
+    resume_from_checkpoint: Optional[str] = None,
     num_epochs: int = 50,
     batch_size: int = 16,
     shuffle: bool = True,
@@ -36,11 +47,10 @@ def train(
 ):
     """Train a diffusers diffusion model.
 
-    To resume from a checkpoint, load it first with ``load_checkpoint()`` and
-    pass the returned objects directly into this function. Augmentations are
-    expected to be built into the dataset object directly (e.g. via
-    ``ArrayDataset.augmentations``), and are checkpointed automatically if the
-    dataset exposes an ``augmentations`` attribute.
+    ``model`` is optional when ``resume_from_checkpoint`` is set — the model
+    (and any unspecified scheduler/optimizer/augmentations) are loaded from the
+    checkpoint automatically.  Augmentations are checkpointed automatically if
+    the dataset exposes an ``augmentations`` attribute.
 
     The model's forward call is dispatched automatically: if the batch contains
     ``"labels"``, they are passed as a keyword argument (for
@@ -54,8 +64,9 @@ def train(
             ``"labels"`` key (LongTensor of shape ``(batch_size,)``) for
             class-conditional DiT training. Augmentations should be applied
             inside the dataset's ``__getitem__``.
-        model (nn.Module): Pre-instantiated diffusers model (e.g.
-            ``UNet2DModel``, ``DiTTransformer2DModel``).
+        model (nn.Module, optional): Pre-instantiated diffusers model (e.g.
+            ``UNet2DModel``, ``DiTTransformer2DModel``).  May be omitted when
+            ``resume_from_checkpoint`` is provided.
         noise_scheduler (optional): Pre-instantiated diffusers noise scheduler.
             Defaults to ``DDPMScheduler(num_train_timesteps=1000)``.
         optimizer (torch.optim.Optimizer, optional): Optimizer for ``model``.
@@ -65,6 +76,12 @@ def train(
             fixed learning rate for the entire run.
         output_dir (str): Root directory for checkpoints and TensorBoard logs.
             Defaults to ``"checkpoints"``.
+        resume_from_checkpoint (str, optional): Path to a checkpoint directory
+            produced by a previous call to ``train()``.  Objects not explicitly
+            passed (model, noise_scheduler, optimizer, lr_scheduler) are loaded
+            from the checkpoint.  After ``accelerator.prepare()`` the full
+            training state (optimizer moments, grad scaler, RNG) is restored
+            via ``accelerator.load_state()``.
         num_epochs (int): Total number of training epochs. Defaults to ``50``.
         batch_size (int): Per-device batch size. Defaults to ``16``.
         shuffle (bool): Shuffle the dataset each epoch. Defaults to ``True``.
@@ -104,23 +121,25 @@ def train(
             # dataset must return dicts with "images" and "labels" keys
             train(my_dataset, model)
 
-        Resume from a checkpoint::
+        Resume from a checkpoint (model loaded automatically)::
 
-            model, noise_scheduler, optimizer, lr_scheduler, augmentations = (
-                load_checkpoint("checkpoints/checkpoint-epoch-10")
-            )
-            dataset.augmentations = augmentations
-            train(
-                my_dataset,
-                model,
-                noise_scheduler=noise_scheduler,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-            )
+            train(my_dataset, resume_from_checkpoint="checkpoints/checkpoint-epoch-10")
     """
     # ------------------------------------------------------------------ #
-    # 1.  Defaults                                                         #
+    # 1.  Defaults / checkpoint loading                                    #
     # ------------------------------------------------------------------ #
+    if model is None and resume_from_checkpoint is None:
+        raise ValueError(
+            "Either `model` or `resume_from_checkpoint` must be provided."
+        )
+
+    if resume_from_checkpoint is not None:
+        model, noise_scheduler, optimizer, lr_scheduler, _aug = (
+            utils.load_checkpoint(resume_from_checkpoint)
+        )
+        if isinstance(dataset, utils.ArrayDataset):
+            dataset.augmentations = _aug
+
     if noise_scheduler is None:
         noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
@@ -142,6 +161,26 @@ def train(
     )
     accelerator.init_trackers(project_name="cosmodiff")
 
+    # Register hooks so save_state() delegates model serialisation to
+    # save_pretrained() and load_state() restores via from_pretrained(),
+    # avoiding a redundant second copy of the weights on disk.
+    def _save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            for m in models:
+                m.save_pretrained(output_dir)
+            weights.clear()
+
+    def _load_model_hook(models, input_dir):
+        for _ in range(len(models)):
+            m = models.pop()
+            loaded = m.__class__.from_pretrained(input_dir)
+            m.register_to_config(**loaded.config)
+            m.load_state_dict(loaded.state_dict())
+            del loaded
+
+    accelerator.register_save_state_pre_hook(_save_model_hook)
+    accelerator.register_load_state_pre_hook(_load_model_hook)
+
     # ------------------------------------------------------------------ #
     # 3.  DataLoader                                                       #
     # ------------------------------------------------------------------ #
@@ -160,6 +199,10 @@ def train(
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, dataloader, lr_scheduler
     )
+
+    if resume_from_checkpoint is not None:
+        accelerator.load_state(resume_from_checkpoint)
+
     # ------------------------------------------------------------------ #
     # 5.  Training loop                                                    #
     # ------------------------------------------------------------------ #
@@ -261,14 +304,32 @@ def train(
         if (epoch + 1) % checkpoint_every_n_epochs == 0 or epoch == num_epochs - 1:
             if accelerator.is_main_process:
                 ckpt_save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch:04d}")
+
+                # Noise scheduler config (needed by SchedulerClass.from_pretrained)
+                noise_scheduler.save_pretrained(ckpt_save_path)
+
+                # Class names and constructor kwargs for fresh reconstruction:
+                # this is only needed when resuming training from a checkpoint.
+                raw_opt = optimizer.optimizer
+                raw_sched = lr_scheduler.scheduler
+                ckpt_cfg = {
+                    "noise_scheduler": {
+                        "class": f"{noise_scheduler.__class__.__module__}.{noise_scheduler.__class__.__name__}",
+                    },
+                    "optimizer": {
+                        "class": f"{raw_opt.__class__.__module__}.{raw_opt.__class__.__name__}",
+                    },
+                    "lr_scheduler": {
+                        "class": f"{raw_sched.__class__.__module__}.{raw_sched.__class__.__name__}",
+                        "kwargs": utils._get_lr_scheduler_kwargs(raw_sched),
+                    },
+                }
+                with open(os.path.join(ckpt_save_path, "checkpoint_config.yaml"), "w") as f:
+                    yaml.dump(_to_yaml_safe(ckpt_cfg), f)
+
+                # Model weights (via hook) + optimizer moments + grad scaler + RNG
                 accelerator.save_state(ckpt_save_path)
-                accelerator.unwrap_model(model).save_pretrained(ckpt_save_path)
-                with open(os.path.join(ckpt_save_path, "optimizer.pkl"), "wb") as f:
-                    pickle.dump(optimizer.optimizer, f)
-                with open(os.path.join(ckpt_save_path, "noise_scheduler.pkl"), "wb") as f:
-                    pickle.dump(noise_scheduler, f)
-                with open(os.path.join(ckpt_save_path, "lr_scheduler.pkl"), "wb") as f:
-                    pickle.dump(lr_scheduler.scheduler, f)
+
                 if hasattr(dataset, "augmentations") and dataset.augmentations is not None:
                     with open(os.path.join(ckpt_save_path, "augmentations.pkl"), "wb") as f:
                         pickle.dump(dataset.augmentations, f)
@@ -356,10 +417,7 @@ def generate(
         else:
             noise_pred = model(images, timesteps, return_dict=False)[0]
 
-        step_kwargs = {}
-        if "generator" in noise_scheduler.step.__code__.co_varnames:
-            step_kwargs["generator"] = generator
-        images = noise_scheduler.step(noise_pred, t, images, **step_kwargs).prev_sample
+        images = noise_scheduler.step(noise_pred, t, images, generator=generator).prev_sample
 
     if renorm is not None:
         images = renorm(images)
