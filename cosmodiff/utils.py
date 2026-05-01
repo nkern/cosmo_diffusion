@@ -268,11 +268,12 @@ def minmax_norm(x: torch.Tensor) -> torch.Tensor:
     return x * 2 - 1
 
 
-def center_scale_norm(x: torch.Tensor):
-    """Center a tensor based on its median, and normalize by its absolute deviation.
+def center_scale_norm(x: torch.Tensor, inplace: bool = False):
+    """Center a tensor based on its mean, and normalize by its absolute deviation.
 
     Args:
         x (torch.Tensor): Input tensor of any shape.
+        inplace (bool): If True, edit inplace. 
 
     Returns:
         torch.Tensor: scaled tensor
@@ -281,8 +282,12 @@ def center_scale_norm(x: torch.Tensor):
     """
     # center
     avg = x.mean()
-    x -= avg
+    if inplace:
+        x -= avg
+    else:
+        x = x - avg
 
+    # scale by max-abs
     x /= x.abs().max()
 
     return x
