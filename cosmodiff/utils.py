@@ -67,7 +67,7 @@ def load_data(
     label_path: str | np.ndarray | None = None,
     label_read_fn: Optional[callable] = None,
     log: bool = False,
-    minmax: bool = True,
+    norm: str | None = None,
     two_dim: bool = True,
     zthin: int = 1,
     n_samples: int | None = None,
@@ -107,8 +107,8 @@ def load_data(
             if ``label_path`` is already a numpy array. Defaults to ``None``.
         log (bool): Apply a log transform to images before normalization.
             Defaults to ``False``.
-        minmax (bool): Normalize images to ``[-1, 1]`` via min-max scaling.
-            Defaults to ``True``.
+        norm (str): Normalize images via "min-max" scaling ``[-1, 1]``,
+            or "center-scale".
         two_dim (bool): If ``True``, reshape the data to treat each z-slice
             as an independent 2D image. If ``False``, treat each sample as a
             3D volume. Defaults to ``True``.
@@ -179,9 +179,11 @@ def load_data(
     if log:
         images = images.log()
 
-    if minmax:
-        images = images - images.min()
-        images = images / images.max() * 2 - 1.0
+    if norm is not None:
+        if norm == 'center-scale':
+            images = center_scale_norm(images)
+        elif norm == 'min-max':
+            images = minmax_norm(images)
 
     # --- reshape --------------------------------------------------------
     if two_dim:
@@ -266,12 +268,11 @@ def minmax_norm(x: torch.Tensor) -> torch.Tensor:
     return x * 2 - 1
 
 
-def center_scale_norm(x: torch.Tensor, scale: int = 10):
-    """Center a tensor based on its median, and normalize by its scale
+def center_scale_norm(x: torch.Tensor):
+    """Center a tensor based on its median, and normalize by its absolute deviation.
 
     Args:
         x (torch.Tensor): Input tensor of any shape.
-        scale (int): Number of standard deviations to scale by
 
     Returns:
         torch.Tensor: scaled tensor
@@ -279,14 +280,12 @@ def center_scale_norm(x: torch.Tensor, scale: int = 10):
         float: std
     """
     # center
-    avg = x.median()
+    avg = x.mean()
     x -= avg
 
-    # norm
-    std = x.std()
-    x /= std * scale
+    x /= x.abs().max()
 
-    return x, avg, std
+    return x
 
 
 def parse_config_model(config: dict):
@@ -387,7 +386,7 @@ def parse_config_data(config: dict):
         device=device,
         dtype=dtype,
         label_read_fn=label_read_fn,
-        minmax=data_cfg.get("minmax", True),
+        norm=data_cfg.get("norm", 'center-scale'),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
     )

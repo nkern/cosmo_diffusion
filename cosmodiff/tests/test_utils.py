@@ -25,10 +25,10 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 
 def test_n_samples():
     arr = _make_array(n=20)
-    images, _ = load_data(arr, img_read_fn=None, minmax=False, two_dim=False)
+    images, _ = load_data(arr, img_read_fn=None, norm=None, two_dim=False)
     assert images.shape[0] == 20
 
-    images, _ = load_data(arr, img_read_fn=None, n_samples=7, minmax=False, two_dim=False)
+    images, _ = load_data(arr, img_read_fn=None, n_samples=7, norm=None, two_dim=False)
     assert images.shape[0] == 7
 
     arr_t = torch.as_tensor(arr)
@@ -47,7 +47,7 @@ def test_n_samples_labels_in_sync():
         arr, img_read_fn=None,
         label_path=labels, label_read_fn=None,
         n_samples=7, seed=0,
-        minmax=False, two_dim=False,
+        norm=None, two_dim=False,
     )
     assert images.shape[0] == 7
     assert out_labels.shape[0] == 7
@@ -60,9 +60,9 @@ def test_n_samples_labels_in_sync():
 
 def test_seed():
     arr = _make_array(n=50)
-    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, minmax=False, two_dim=False)
-    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, minmax=False, two_dim=False)
-    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=99, minmax=False, two_dim=False)
+    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
+    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
+    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=99, norm=None, two_dim=False)
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
@@ -72,8 +72,8 @@ def test_memmap():
     with tempfile.NamedTemporaryFile(suffix=".npy") as f:
         np.save(f.name, arr)
         mmap = np.load(f.name, mmap_mode="r")
-        images_all, _ = load_data(mmap, img_read_fn=None, minmax=False, two_dim=False)
-        images_sub, _ = load_data(mmap, img_read_fn=None, n_samples=5, minmax=False, two_dim=False)
+        images_all, _ = load_data(mmap, img_read_fn=None, norm=None, two_dim=False)
+        images_sub, _ = load_data(mmap, img_read_fn=None, n_samples=5, norm=None, two_dim=False)
     assert images_all.shape[0] == 10
     assert images_sub.shape[0] == 5
 
@@ -109,9 +109,9 @@ def test_minmax_norm():
 
 def test_center_scale_norm():
     x = torch.randn(100)
-    out, avg, std = center_scale_norm(x.clone(), scale=10)
-    assert abs(out.median().item()) < 0.1
-    assert out.abs().max().item() < 2.0
+    out = center_scale_norm(x.clone())
+    assert abs(out.mean().item()) < 0.1
+    assert out.abs().max().item() <= 1.0 + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ def test_parse_config_data():
             "img_path": img_path,
             "img_read_fn": "npy_read_fn",
             "log": False,
-            "minmax": True,
+            "norm": "min-max",
             "two_dim": True,
             "zthin": 1,
             "keep_on_cpu": True,

@@ -16,7 +16,7 @@ data:
   label_path: /path/to/labels.npy # optional
   label_read_fn: npy_read_fn      # optional
   log: false
-  minmax: true
+  norm: center-scale
   two_dim: true
   zthin: 4
   n_samples: null
