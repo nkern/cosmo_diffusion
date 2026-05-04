@@ -123,11 +123,13 @@ def train(
 
         Resume from a checkpoint (model loaded automatically)::
 
-            train(my_dataset, resume_from_checkpoint="checkpoints/checkpoint-epoch-10")
+            train(my_dataset, resume_from_checkpoint="checkpoints/checkpoint-epoch-0010")
     """
     # ------------------------------------------------------------------ #
     # 1.  Defaults / checkpoint loading                                    #
     # ------------------------------------------------------------------ #
+    start_epoch = 0
+
     if model is None and resume_from_checkpoint is None:
         raise ValueError(
             "Either `model` or `resume_from_checkpoint` must be provided."
@@ -139,6 +141,8 @@ def train(
         )
         if isinstance(dataset, utils.ArrayDataset):
             dataset.augmentations = _aug
+
+        start_epoch = int(resume_from_checkpoint.split('-')[-1]) + 1
 
     if noise_scheduler is None:
         noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
@@ -217,10 +221,10 @@ def train(
         "epoch_lr": [],
     }
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, start_epoch + num_epochs):
         progress = tqdm(
             dataloader,
-            desc=f"Epoch {epoch}/{num_epochs - 1}",
+            desc=f"Epoch {epoch}/{start_epoch + num_epochs - 1}",
             disable=not verbose or not accelerator.is_local_main_process,
         )
 
@@ -301,7 +305,7 @@ def train(
         # ---------------------------------------------------------------- #
         # 6.  Checkpointing                                                 #
         # ---------------------------------------------------------------- #
-        if (epoch + 1) % checkpoint_every_n_epochs == 0 or epoch == num_epochs - 1:
+        if (epoch + 1) % checkpoint_every_n_epochs == 0 or epoch == (start_epoch + num_epochs - 1):
             if accelerator.is_main_process:
                 ckpt_save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch:04d}")
 

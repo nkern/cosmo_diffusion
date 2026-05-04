@@ -521,15 +521,10 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     """Plot training metrics from a dictionary or JSON file produced by
     ``write_metrics()``.
 
-    Produces four plots:
+    Produces three plots:
         - Batch loss over training steps
         - Epoch loss over epochs
         - Learning rate over epochs
-        - Epoch wall time
-
-    matplotlib is imported lazily inside this function so it is not a strict
-    dependency of cosmodiff. If plotting on a remote server with no display,
-    use ``save_dir`` and set ``show=False``.
 
     Args:
         metrics (dict or str): Metrics dictionary returned by ``train()``, or
@@ -560,58 +555,58 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
         os.makedirs(save_dir, exist_ok=True)
 
     # --- batch loss -----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig1, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["loss"], alpha=0.7)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     ax.set_title("Batch Loss")
     ax.set_yscale('log')
-    fig.tight_layout()
+    fig1.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
+        fig1.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- epoch loss -----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig2, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["epoch_loss"], marker="o")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Epoch Loss")
     ax.set_yscale('log')
-    fig.tight_layout()
+    fig2.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "epoch_loss.png"), dpi=150, bbox_inches="tight")
+        fig2.savefig(os.path.join(save_dir, "epoch_loss.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- learning rate --------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig3, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["epoch_lr"], marker="o")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Learning Rate")
     ax.set_title("Learning Rate Schedule")
-    fig.tight_layout()
+    ax.set_yscale('log')
+    fig3.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "learning_rate.png"), dpi=150, bbox_inches="tight")
+        fig3.savefig(os.path.join(save_dir, "learning_rate.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- epoch times ----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(metrics["epoch_times"], marker="o")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Time (s)")
-    ax.set_title("Epoch Wall Time")
-    fig.tight_layout()
-    if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "epoch_times.png"), dpi=150, bbox_inches="tight")
-    if show:
-        plt.show()
-    plt.close(fig)
+    #fig, ax = plt.subplots(figsize=(8, 4))
+    #ax.plot(metrics["epoch_times"], marker="o")
+    #ax.set_xlabel("Epoch")
+    #ax.set_ylabel("Time (s)")
+    #ax.set_title("Epoch Wall Time")
+    #fig.tight_layout()
+    #if save_dir is not None:
+    #    fig.savefig(os.path.join(save_dir, "epoch_times.png"), dpi=150, bbox_inches="tight")
+    #if show:
+    #    plt.show()
+    #plt.close(fig)
+
+    return fig1, fig2, fig3
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
