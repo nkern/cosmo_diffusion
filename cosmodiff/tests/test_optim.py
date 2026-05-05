@@ -22,7 +22,7 @@ def test_train_basic():
     )
 
     images = torch.randn(16, 1, 8, 8)
-    augmentations = torch.nn.Sequential(RandomRoll(dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
+    augmentations = torch.nn.Sequential(RandomRoll(size=8, dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
     dataset = ArrayDataset(images, augmentations=augmentations)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -107,7 +107,7 @@ def test_train_conditional_dit():
 
     images = torch.randn(16, 1, 4, 4)
     labels = torch.randint(0, 4, (16,))
-    augmentations = torch.nn.Sequential(RandomRoll(dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
+    augmentations = torch.nn.Sequential(RandomRoll(size=4, dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
     dataset = ArrayDataset(images, labels=labels, augmentations=augmentations)
 
     with tempfile.TemporaryDirectory() as tmp_dir:

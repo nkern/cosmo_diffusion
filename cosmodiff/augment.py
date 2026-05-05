@@ -9,16 +9,17 @@ class RandomRoll(nn.Module):
     Args:
         dims (tuple of int): Dimensions to roll along. Defaults to ``(-1,)``.
     """
-    def __init__(self, dims=(-1,)):
+    def __init__(self, size=128, dims=(-1,)):
         super().__init__()
+        self.size = size
         self.dims = tuple(dims)
         self.ndim = len(dims)
 
     def __call__(self, x):
         if x is None:
             return None
-        shift = (torch.rand(self.ndim, device='cpu') * torch.tensor(x.shape)[list(self.dims)]).round().to(torch.long)
-        return torch.roll(x, tuple(shift), self.dims)
+        shift = torch.randint(0, self.size, (self.ndim,), dtype=torch.long, device='cpu').tolist()
+        return torch.roll(x, shift, self.dims)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(dims={self.dims})"
@@ -68,15 +69,18 @@ class RandomFlip(nn.Module):
     """
     def __init__(self, dims=(-2, -1), p=0.5):
         super().__init__()
-        self.dims = tuple(dims)
+        self.dims = list(dims)
         self.p = p
 
     def __call__(self, x):
         if x is None:
             return None
-        flip = torch.rand(len(self.dims), device='cpu')
-        flip = torch.where(flip < self.p)[0].tolist()
-        return torch.flip(x, flip)
+        draw = torch.rand(len(self.dims), device='cpu')
+        flip = torch.where(draw < self.p)[0].tolist()
+        if len(flip) == 0:
+            return x
+        else:
+            return torch.flip(x, [self.dims[f] for f in flip])
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(dims={self.dims}, p={self.p})"
@@ -118,5 +122,4 @@ def config_augmentations(augmentations):
         pipeline.append(getattr(augment, name)(**kwargs))
 
     return nn.Sequential(*pipeline)
-
 

@@ -41,11 +41,12 @@ class ArrayDataset(Dataset):
             dataset = ArrayDataset(images, labels=labels)
             # {"images": tensor, "labels": tensor}
     """
-    def __init__(self, arrays: torch.Tensor, labels: torch.Tensor = None, augmentations: callable = None):
-        # CUDA tensors cannot be shared across DataLoader worker processes (fork
-        # cannot inherit the CUDA context). Move to CPU; the training loop
-        # (via accelerate) handles GPU placement per-batch.
-        self.arrays = arrays.cpu()
+    def __init__(self,
+        arrays: torch.Tensor,
+        labels: torch.Tensor = None,
+        augmentations: callable = None,
+    ):
+        self.arrays = arrays
         self.labels = labels
         self.augmentations = augmentations
 
@@ -68,12 +69,13 @@ def load_data(
     dtype: torch.dtype | None = None,
     label_path: str | np.ndarray | None = None,
     label_read_fn: Optional[callable] = None,
-    log: bool = False,
-    norm: str | None = None,
     two_dim: bool = True,
     zthin: int = 1,
     n_samples: int | None = None,
     seed: np.random.Generator | None = None,
+    log: bool = False,
+    normalization: str | None = None,
+    norm_kwargs: {} | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -107,16 +109,17 @@ def load_data(
         label_read_fn (callable, optional): User-provided function that accepts
             ``label_path`` and returns a numpy array of shape ``(N,)``. Ignored
             if ``label_path`` is already a numpy array. Defaults to ``None``.
-        log (bool): Apply a log transform to images before normalization.
-            Defaults to ``False``.
-        norm (str): Normalize images via "min-max" scaling ``[-1, 1]``,
-            or "center-scale".
         two_dim (bool): If ``True``, reshape the data to treat each z-slice
             as an independent 2D image. If ``False``, treat each sample as a
             3D volume. Defaults to ``True``.
         zthin (int): Thinning factor along the z axis, applied before
             reshaping when ``two_dim=True``. A value of ``1`` applies no
             thinning. Defaults to ``1``.
+        log (bool): Apply a log transform to images before normalization.
+            Defaults to ``False``.
+        normalization (str): Normalize image pixel distribution.
+            ['min-max', 'center-max']
+        norm_kwargs: kwargs for pixel normalization function
 
     Returns:
         tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` on
@@ -181,11 +184,10 @@ def load_data(
     if log:
         images = images.log()
 
-    if norm is not None:
-        if norm == 'center-scale':
-            images = center_scale_norm(images)
-        elif norm == 'min-max':
-            images = minmax_norm(images)
+    norm = None
+    if normalization is not None:
+        norm = Normalization(normalization, inplace=False, **norm_kwargs)
+        images = norm(images)
 
     # --- reshape --------------------------------------------------------
     if two_dim:
@@ -194,7 +196,7 @@ def load_data(
     else:
         images = images.unsqueeze(1)
 
-    return images, labels
+    return images, labels, norm
 
 
 def _import_class(qualified_name: str):
@@ -272,43 +274,147 @@ def load_checkpoint(ckpt_path: str):
     return model, noise_scheduler, optimizer, lr_scheduler, augmentations
 
 
-def minmax_norm(x: torch.Tensor) -> torch.Tensor:
+def minmax_norm(
+    x: torch.Tensor,
+    xmin: float | None = None,
+    xmax: float | None = None,
+    inverse: bool = False,
+    inplace: bool = False,
+    **kwargs
+) -> torch.Tensor:
     """Normalize a tensor to ``[-1, 1]`` via min-max scaling.
 
     Args:
         x (torch.Tensor): Input tensor of any shape.
+        xmin (float): normalize by min, default is x.min()
+        xmax (float): normalize by max, default is x.max()
+        inverse (bool): if True, apply the inverse mapping (requires xmin, xmax)
+        inplace (bool): edit tensor inplace, default is False
 
     Returns:
         torch.Tensor: Normalized tensor with values in ``[-1, 1]``.
+        dict: normalization parameters
     """
-    x = x - x.min()
-    x = x / x.max()
-    return x * 2 - 1
+    if not inplace:
+        x = x.clone()
+    if not inverse:
+        if xmin is None:
+            xmin = x.min()
+        if xmax is None:
+            xmax = x.max()
+        x -= xmin
+        x *= 2 / xmax
+        x -= 1
+
+    else:
+        assert xmin is not None
+        assert xmax is not None
+        x = (x + 1) / 2 * xmax + xmin
+
+    return x, {'xmin': xmin, 'xmax': xmax}
 
 
-def center_scale_norm(x: torch.Tensor, inplace: bool = False):
-    """Center a tensor based on its mean, and normalize by its absolute deviation.
+def center_max_norm(
+    x: torch.Tensor,
+    center: float | None = None,
+    xmax: float | None = None,
+    inverse: bool | None = False,
+    inplace: bool = False,
+    **kwargs
+):
+    """Center a tensor based on its average, and normalize by its absolute deviation.
 
     Args:
         x (torch.Tensor): Input tensor of any shape.
+        center (float): average centering to subtract off
+        xmax (float): abs-max normalization to divide by
+        inverse (bool): apply inverse operation, requires center and xmax
         inplace (bool): If True, edit inplace. 
 
     Returns:
         torch.Tensor: scaled tensor
-        float: avg
-        float: std
+        dict: normalization parameters
     """
-    # center
-    avg = x.mean()
-    if inplace:
-        x -= avg
+    if not inplace:
+        x = x.clone()
+
+    if not inverse:
+        # center
+        if center is None:
+            center = x.mean()
+        x -= center
+
+        # scale by max-abs
+        if xmax is None:
+            xmax = x.abs().max()
+        x /= xmax
+
     else:
-        x = x - avg
+        assert xmax is not None
+        assert center is not None
+        x *= xmax
 
-    # scale by max-abs
-    x /= x.abs().max()
+    return x, {'center': center, 'xmax': xmax}
 
-    return x
+
+def tanh_norm(x, alpha=1.0, beta=1.0, gamma=1.0, delta=1.0, mu=0.0, inverse=False, **kwargs):
+    """
+    A unified function for a dual-saturating tanh transform.
+    
+    Args:
+        x (tensor): Input tensor
+        alpha (float): Positive saturation limit (upper bound).
+        beta (float): Negative saturation limit (magnitude of lower bound).
+        gamma (float): Multiplicative gain for the positive side.
+        delta (float): Multiplicative gain for the negative side.
+        mu (float): Mean shift / center point.
+        inverse (bool): Toggle between forward and inverse operations.
+
+    Returns:
+        torch.Tensor: normalized data
+        dict: normalization parameters
+    """
+    if not inverse:
+        # Forward: x -> y
+        x_shifted = data - mu
+        pos = alpha * torch.tanh((gamma * x_shifted) / alpha)
+        neg = beta * torch.tanh((delta * x_shifted) / beta)
+        y = torch.where(x_shifted >= 0, pos, neg)
+    else:
+        # Inverse: y -> x
+        # Note: data (y) should be clamped within (-beta, alpha) for stability
+        y = torch.clamp(data, -beta + 1e-9, alpha - 1e-9)
+        pos_inv = (alpha * torch.atanh(y / alpha)) / gamma
+        neg_inv = (beta * torch.atanh(y / beta)) / delta
+        y =  torch.where(y >= 0, pos_inv, neg_inv) + mu
+
+    params = {'mu': mu, 'alpha': alpha, 'beta': beta, 'delta': delta, 'gamma': gamma}
+    return y, params
+
+
+class Normalization(torch.nn.Module):
+    """A data normalization object"""
+
+    def __init__(self, method: str, inplace: bool = False, **kwargs):
+        self.method = method
+        self.inplace = inplace
+        self.kwargs = kwargs
+
+    def forward(self, x, inverse=False):
+        if self.method in ['minmax', 'min-max']:
+            x, kw = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+            self.kwargs.update(kw)
+
+        elif self.method in ['centermax', 'center-max']:
+            x, kw = center_max_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+            self.kwargs.update(kw)
+
+        elif self.method in ['tanh']:
+            x, kw = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+            self.kwargs.update(kw)
+
+    def inverse(self, x):
+        return self.forward(x, inverse=True)
 
 
 def parse_config_model(config: dict):
@@ -374,13 +480,14 @@ def parse_config_data(config: dict):
 
     Returns:
         ArrayDataset: Dataset ready to be passed to ``train()``.
+        Normalization: object that (un) normalizes the data
 
     Example::
 
         with open("config.yaml") as f:
             config = yaml.safe_load(f)
 
-        dataset = parse_config_data(config)
+        dataset, norm = parse_config_data(config)
     """
     import cosmodiff.utils as utils_module
     from cosmodiff.utils import ArrayDataset, load_data
@@ -423,7 +530,7 @@ def parse_config_data(config: dict):
 
         all_images, all_labels = [], []
         for p, lp, ns, sd, lg in zip(img_path, label_paths, n_samples_list, seeds_list, log_list):
-            imgs, lbls = load_data(img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, **_load_kwargs)
+            imgs, lbls, norm = load_data(img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, **_load_kwargs)
             all_images.append(imgs)
             if lbls is not None:
                 all_labels.append(lbls)
@@ -431,7 +538,7 @@ def parse_config_data(config: dict):
         images = torch.cat(all_images, dim=0)
         labels = torch.cat(all_labels, dim=0) if all_labels else None
     else:
-        images, labels = load_data(
+        images, labels, norm = load_data(
             img_path=img_path,
             label_path=label_path,
             n_samples=n_samples,
@@ -445,7 +552,7 @@ def parse_config_data(config: dict):
         from cosmodiff.augment import config_augmentations
         augmentations = config_augmentations(config["augmentations"])
 
-    return ArrayDataset(images, labels=labels, augmentations=augmentations)
+    return ArrayDataset(images, labels=labels, augmentations=augmentations), norm
 
 
 def npy_read_fn(fname):

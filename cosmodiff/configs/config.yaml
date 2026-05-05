@@ -15,17 +15,23 @@ data:
   img_read_fn: npy_read_fn        # any function in cosmodiff.utils
   label_path: /path/to/labels.npy # optional
   label_read_fn: npy_read_fn      # optional
-  log: false
-  norm: center-scale
   two_dim: true
   zthin: 4
   n_samples: null
   seed: null
   keep_on_cpu: false
+  log: false
+  normalization: center-max  # data norm and kwargs
+  norm_kwargs:
+    center: null
+    xmax: null
+    alpha: null
+    beta: null
 
 # --- augmentations ---
 augmentations:
   RandomRoll:
+    size: 128
     dims: [-1, -2]
   RandomFlip:
     dims: [-1, -2]
