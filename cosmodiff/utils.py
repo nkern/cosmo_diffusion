@@ -299,9 +299,9 @@ def minmax_norm(
         x = x.clone()
     if not inverse:
         if xmin is None:
-            xmin = x.min()
+            xmin = x.min().item()
         if xmax is None:
-            xmax = x.max()
+            xmax = x.max().item()
         x -= xmin
         x *= 2 / xmax
         x -= 1
@@ -341,12 +341,12 @@ def center_max_norm(
     if not inverse:
         # center
         if center is None:
-            center = x.mean()
+            center = x.mean().item()
         x -= center
 
         # scale by max-abs
         if xmax is None:
-            xmax = x.abs().max()
+            xmax = x.abs().max().item()
         x /= xmax
 
     else:
@@ -419,13 +419,13 @@ class Normalization(torch.nn.Module):
 
         elif self.method in ['tanh']:
             if not inverse:
-                x, kw = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                x, kw = center_max_norm(x, inplace=self.inplace, **self.kwargs)
                 self.kwargs.update(kw)
-                x, kw = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                x, kw = tanh_norm(x, inplace=self.inplace, **self.kwargs)
                 self.kwargs.update(kw)
             else:
                 x, _ = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-                x, _ = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                x, _ = center_max_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
 
         return x
 
