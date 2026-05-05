@@ -210,7 +210,7 @@ def test_normalization_tanh():
     assert out.min().item() > -norm.kwargs['beta'] * norm.kwargs['sigma']
     assert out.max().item() < norm.kwargs['alpha'] * norm.kwargs['sigma']
     # params from both stages must be stored after forward
-    assert all(k in norm.kwargs for k in ('xmin', 'xmax', 'mu', 'alpha', 'beta', 'gamma', 'delta', 'sigma'))
+    assert all(k in norm.kwargs for k in ('center', 'xmax', 'mu', 'alpha', 'beta', 'gamma', 'delta', 'sigma'))
 
 
 def test_normalization_tanh_inverse():
@@ -237,6 +237,7 @@ def test_normalization_params_fixed_when_given():
 
 def test_normalization_params_inferred_on_first_forward():
     """Params not supplied at init must be populated after the first forward pass."""
+    import copy
     norm = Normalization('min-max', inplace=False)
     assert 'xmin' not in norm.kwargs
     assert 'xmax' not in norm.kwargs
@@ -246,17 +247,17 @@ def test_normalization_params_inferred_on_first_forward():
 
     assert 'xmin' in norm.kwargs, "xmin not set after first forward"
     assert 'xmax' in norm.kwargs, "xmax not set after first forward"
-    assert torch.allclose(norm.kwargs['xmin'], x.min())
-    assert torch.allclose(norm.kwargs['xmax'], x.max())
+    assert np.allclose(norm.kwargs['xmin'], x.min().item())
+    assert np.allclose(norm.kwargs['xmax'], x.max().item())
 
     # second forward on different data must reuse the inferred params, not recompute
     y = torch.rand(10, 1, 8, 8) * 10 + 5
-    xmin_after_first = norm.kwargs['xmin'].clone()
-    xmax_after_first = norm.kwargs['xmax'].clone()
+    xmin_after_first = copy.copy(norm.kwargs['xmin'])
+    xmax_after_first = copy.copy(norm.kwargs['xmax'])
     norm(y)
 
-    assert torch.equal(norm.kwargs['xmin'], xmin_after_first), "xmin changed on second forward"
-    assert torch.equal(norm.kwargs['xmax'], xmax_after_first), "xmax changed on second forward"
+    assert np.allclose(norm.kwargs['xmin'], xmin_after_first), "xmin changed on second forward"
+    assert np.allclose(norm.kwargs['xmax'], xmax_after_first), "xmax changed on second forward"
 
 
 # ---------------------------------------------------------------------------
