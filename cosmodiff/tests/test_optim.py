@@ -3,7 +3,7 @@ import tempfile
 import numpy as np
 import torch
 from diffusers import UNet2DModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
-from cosmodiff.utils import load_checkpoint, ArrayDataset
+from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
 from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
 from cosmodiff.augment import RandomRoll, RandomFlip
 
@@ -42,9 +42,9 @@ def test_train_basic():
 
         ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
-        assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "scheduler_config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "checkpoint_config.yaml"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
@@ -64,12 +64,11 @@ def test_train_basic():
         assert _lr_scheduler is not None
         assert _augmentations is not None
 
-        # continue training
+        # continue training from checkpoint
         initial_weights = model.conv_in.weight.data.clone()
         metrics = train(
             dataset,
-            model,
-            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            resume_from_checkpoint=ckpt_path,
             num_epochs=2,
             batch_size=4,
             checkpoint_every_n_epochs=2,
@@ -79,10 +78,17 @@ def test_train_basic():
             verbose=False,
         )
 
+        # get new checkpoint: ensure it is epoch-0003
+        ckpt_path2 = find_latest_checkpoint(tmp_dir)
+        assert int(ckpt_path2.split('-')[-1]) == 3
+        _model2, _noise_scheduler2, _optimizer2, _lr_scheduler2, _augmentations2 = (
+            load_checkpoint(ckpt_path2)
+        )
+
         # training checks: finite output, and weights changed
         assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
         assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
-        assert not torch.allclose(model.conv_in.weight.data, initial_weights)
+        assert not torch.allclose(_model2.conv_in.weight.data, initial_weights)
 
 
 def test_train_conditional_dit():
@@ -121,9 +127,9 @@ def test_train_conditional_dit():
 
         ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
         assert os.path.isdir(ckpt_path)
-        assert os.path.exists(os.path.join(ckpt_path, "noise_scheduler.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "optimizer.pkl"))
-        assert os.path.exists(os.path.join(ckpt_path, "lr_scheduler.pkl"))
+        assert os.path.exists(os.path.join(ckpt_path, "config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "scheduler_config.json"))
+        assert os.path.exists(os.path.join(ckpt_path, "checkpoint_config.yaml"))
         assert os.path.exists(os.path.join(ckpt_path, "augmentations.pkl"))
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 

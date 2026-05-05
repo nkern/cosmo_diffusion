@@ -1,6 +1,8 @@
 import os
 import glob
 import pickle
+import importlib
+import inspect
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -195,17 +197,32 @@ def load_data(
     return images, labels
 
 
+def _import_class(qualified_name: str):
+    module_name, class_name = qualified_name.rsplit(".", 1)
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+def _get_lr_scheduler_kwargs(scheduler) -> dict:
+    sig = inspect.signature(scheduler.__class__.__init__)
+    kwargs = {}
+    for name in sig.parameters:
+        if name in ("self", "optimizer", "last_epoch", "verbose"):
+            continue
+        if hasattr(scheduler, name):
+            kwargs[name] = getattr(scheduler, name)
+    return kwargs
+
+
 def load_checkpoint(ckpt_path: str):
     """Reconstruct model, noise_scheduler, optimizer, lr_scheduler, and
     optionally an augmentation pipeline from a saved checkpoint directory
     produced by ``train()``.
 
-    All objects are returned fully reconstructed and ready to be passed
-    directly into ``train()``. The lr_scheduler and noise_scheduler are
-    stored as pickles so no knowledge of the original class is required.
-    The augmentation pipeline is restored from ``augmentations.pt`` if
-    present in the checkpoint directory and should be re-attached to the
-    dataset before passing it to ``train()``.
+    The returned objects are freshly constructed from the checkpoint config
+    and are ready to be passed directly into ``train()``.  Pass
+    ``resume_from_checkpoint=ckpt_path`` to ``train()`` so it can call
+    ``accelerator.load_state()`` after ``accelerator.prepare()`` to restore
+    optimizer moments, the grad scaler, and RNG state.
 
     Args:
         ckpt_path (str): Path to a checkpoint directory produced by ``train()``.
@@ -216,33 +233,34 @@ def load_checkpoint(ckpt_path: str):
         saved in the checkpoint.
 
     Example:
-        Resume without augmentations::
-
-            model, noise_scheduler, optimizer, lr_scheduler, _ = load_checkpoint(
-                "checkpoints/checkpoint-epoch-10"
-            )
-            train(my_dataset, model, noise_scheduler=noise_scheduler,
-                optimizer=optimizer, lr_scheduler=lr_scheduler)
-
-        Resume with augmentations::
+        Resume training::
 
             model, noise_scheduler, optimizer, lr_scheduler, augmentations = (
                 load_checkpoint("checkpoints/checkpoint-epoch-10")
             )
-            dataset.augmentations = augmentations
-            train(my_dataset, model, noise_scheduler=noise_scheduler,
-                optimizer=optimizer, lr_scheduler=lr_scheduler)
+            if augmentations is not None:
+                dataset.augmentations = augmentations
+            train(
+                my_dataset, model,
+                noise_scheduler=noise_scheduler,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                resume_from_checkpoint="checkpoints/checkpoint-epoch-10",
+            )
     """
     model = AutoModel.from_pretrained(ckpt_path)
 
-    with open(os.path.join(ckpt_path, "noise_scheduler.pkl"), "rb") as f:
-        noise_scheduler = pickle.load(f)
+    with open(os.path.join(ckpt_path, "checkpoint_config.yaml")) as f:
+        cfg = yaml.safe_load(f)
 
-    with open(os.path.join(ckpt_path, "optimizer.pkl"), "rb") as f:
-        optimizer = pickle.load(f)
+    noise_scheduler_cls = _import_class(cfg["noise_scheduler"]["class"])
+    noise_scheduler = noise_scheduler_cls.from_pretrained(ckpt_path)
 
-    with open(os.path.join(ckpt_path, "lr_scheduler.pkl"), "rb") as f:
-        lr_scheduler = pickle.load(f)
+    optimizer_cls = _import_class(cfg["optimizer"]["class"])
+    optimizer = optimizer_cls(model.parameters())
+
+    lr_scheduler_cls = _import_class(cfg["lr_scheduler"]["class"])
+    lr_scheduler = lr_scheduler_cls(optimizer, **cfg["lr_scheduler"]["kwargs"])
 
     augmentations_path = os.path.join(ckpt_path, "augmentations.pkl")
     if os.path.exists(augmentations_path):
@@ -503,15 +521,10 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     """Plot training metrics from a dictionary or JSON file produced by
     ``write_metrics()``.
 
-    Produces four plots:
+    Produces three plots:
         - Batch loss over training steps
         - Epoch loss over epochs
         - Learning rate over epochs
-        - Epoch wall time
-
-    matplotlib is imported lazily inside this function so it is not a strict
-    dependency of cosmodiff. If plotting on a remote server with no display,
-    use ``save_dir`` and set ``show=False``.
 
     Args:
         metrics (dict or str): Metrics dictionary returned by ``train()``, or
@@ -542,58 +555,58 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
         os.makedirs(save_dir, exist_ok=True)
 
     # --- batch loss -----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig1, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["loss"], alpha=0.7)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     ax.set_title("Batch Loss")
     ax.set_yscale('log')
-    fig.tight_layout()
+    fig1.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
+        fig1.savefig(os.path.join(save_dir, "batch_loss.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- epoch loss -----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig2, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["epoch_loss"], marker="o")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Epoch Loss")
     ax.set_yscale('log')
-    fig.tight_layout()
+    fig2.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "epoch_loss.png"), dpi=150, bbox_inches="tight")
+        fig2.savefig(os.path.join(save_dir, "epoch_loss.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- learning rate --------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig3, ax = plt.subplots(figsize=(8, 4))
     ax.plot(metrics["epoch_lr"], marker="o")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Learning Rate")
     ax.set_title("Learning Rate Schedule")
-    fig.tight_layout()
+    ax.set_yscale('log')
+    fig3.tight_layout()
     if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "learning_rate.png"), dpi=150, bbox_inches="tight")
+        fig3.savefig(os.path.join(save_dir, "learning_rate.png"), dpi=150, bbox_inches="tight")
     if show:
         plt.show()
-    plt.close(fig)
 
     # --- epoch times ----------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(metrics["epoch_times"], marker="o")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Time (s)")
-    ax.set_title("Epoch Wall Time")
-    fig.tight_layout()
-    if save_dir is not None:
-        fig.savefig(os.path.join(save_dir, "epoch_times.png"), dpi=150, bbox_inches="tight")
-    if show:
-        plt.show()
-    plt.close(fig)
+    #fig, ax = plt.subplots(figsize=(8, 4))
+    #ax.plot(metrics["epoch_times"], marker="o")
+    #ax.set_xlabel("Epoch")
+    #ax.set_ylabel("Time (s)")
+    #ax.set_title("Epoch Wall Time")
+    #fig.tight_layout()
+    #if save_dir is not None:
+    #    fig.savefig(os.path.join(save_dir, "epoch_times.png"), dpi=150, bbox_inches="tight")
+    #if show:
+    #    plt.show()
+    #plt.close(fig)
+
+    return fig1, fig2, fig3
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
