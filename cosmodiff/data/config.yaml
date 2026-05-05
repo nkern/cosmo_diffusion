@@ -19,7 +19,7 @@ data:
   zthin: 4
   n_samples: null
   seed: null
-  keep_on_cpu: false
+  keep_on_cpu: true
   log: false
   normalization: center-max  # data norm and kwargs
   norm_kwargs:
