@@ -75,7 +75,7 @@ def load_data(
     seed: np.random.Generator | None = None,
     log: bool = False,
     normalization: str | None = None,
-    norm_kwargs: {} | None = None,
+    norm_kwargs: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -186,7 +186,7 @@ def load_data(
 
     norm = None
     if normalization is not None:
-        norm = Normalization(normalization, inplace=False, **norm_kwargs)
+        norm = Normalization(normalization, inplace=False, **(norm_kwargs or {}))
         images = norm(images)
 
     # --- reshape --------------------------------------------------------
@@ -353,20 +353,25 @@ def center_max_norm(
         assert xmax is not None
         assert center is not None
         x *= xmax
+        x += center
 
     return x, {'center': center, 'xmax': xmax}
 
 
-def tanh_norm(x, alpha=1.0, beta=1.0, gamma=1.0, delta=1.0, mu=0.0, inverse=False, **kwargs):
+def tanh_norm(x, alpha=1.0, beta=1.0, gamma=1.0, delta=1.0, sigma=1.0, mu=0.0, inverse=False, **kwargs):
     """
-    A unified function for a dual-saturating tanh transform.
+    tanh normalization
+    
+        f(x) = sigma * alpha * tanh((gamma * (x-mu)) / alpha) if (x-mu) >= 0
+        f(x) = sigma * beta  * tanh((delta * (x-mu)) / beta)  if (x-mu) < 0
     
     Args:
         x (tensor): Input tensor
         alpha (float): Positive saturation limit (upper bound).
-        beta (float): Negative saturation limit (magnitude of lower bound).
+        beta (float): Negative saturation limit (lower bound).
         gamma (float): Multiplicative gain for the positive side.
         delta (float): Multiplicative gain for the negative side.
+        sigma (float): Final scaling
         mu (float): Mean shift / center point.
         inverse (bool): Toggle between forward and inverse operations.
 
@@ -376,19 +381,19 @@ def tanh_norm(x, alpha=1.0, beta=1.0, gamma=1.0, delta=1.0, mu=0.0, inverse=Fals
     """
     if not inverse:
         # Forward: x -> y
-        x_shifted = data - mu
+        x_shifted = x - mu
         pos = alpha * torch.tanh((gamma * x_shifted) / alpha)
         neg = beta * torch.tanh((delta * x_shifted) / beta)
-        y = torch.where(x_shifted >= 0, pos, neg)
+        y = torch.where(x_shifted >= 0, pos, neg) * sigma
     else:
         # Inverse: y -> x
         # Note: data (y) should be clamped within (-beta, alpha) for stability
-        y = torch.clamp(data, -beta + 1e-9, alpha - 1e-9)
+        y = torch.clamp(x / sigma, -beta + 1e-9, alpha - 1e-9)
         pos_inv = (alpha * torch.atanh(y / alpha)) / gamma
         neg_inv = (beta * torch.atanh(y / beta)) / delta
         y =  torch.where(y >= 0, pos_inv, neg_inv) + mu
 
-    params = {'mu': mu, 'alpha': alpha, 'beta': beta, 'delta': delta, 'gamma': gamma}
+    params = {'mu': mu, 'alpha': alpha, 'beta': beta, 'delta': delta, 'gamma': gamma, 'sigma': sigma}
     return y, params
 
 
@@ -396,6 +401,7 @@ class Normalization(torch.nn.Module):
     """A data normalization object"""
 
     def __init__(self, method: str, inplace: bool = False, **kwargs):
+        super().__init__()
         self.method = method
         self.inplace = inplace
         self.kwargs = kwargs
@@ -403,15 +409,25 @@ class Normalization(torch.nn.Module):
     def forward(self, x, inverse=False):
         if self.method in ['minmax', 'min-max']:
             x, kw = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-            self.kwargs.update(kw)
+            if not inverse:
+                self.kwargs.update(kw)
 
         elif self.method in ['centermax', 'center-max']:
             x, kw = center_max_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-            self.kwargs.update(kw)
+            if not inverse:
+                self.kwargs.update(kw)
 
         elif self.method in ['tanh']:
-            x, kw = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-            self.kwargs.update(kw)
+            if not inverse:
+                x, kw = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                self.kwargs.update(kw)
+                x, kw = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                self.kwargs.update(kw)
+            else:
+                x, _ = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+                x, _ = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
+
+        return x
 
     def inverse(self, x):
         return self.forward(x, inverse=True)
@@ -516,7 +532,7 @@ def parse_config_data(config: dict):
         device=device,
         dtype=dtype,
         label_read_fn=label_read_fn,
-        norm=data_cfg.get("norm", 'center-scale'),
+        normalization=data_cfg.get("norm", 'center-max'),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
     )

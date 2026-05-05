@@ -1,18 +1,29 @@
+import copy
+import importlib.resources
 import json
 import tempfile
+from pathlib import Path
 import numpy as np
 import torch
 from cosmodiff.utils import (
     ArrayDataset,
     load_data,
     minmax_norm,
-    center_scale_norm,
+    center_max_norm,
+    tanh_norm,
+    Normalization,
     npy_read_fn,
     parse_config_model,
     parse_config_data,
+    read_config,
     write_metrics,
     read_metrics,
 )
+
+CONFIG_PATH = importlib.resources.files('cosmodiff.data') / 'config.yaml'
+DATA_PATH = importlib.resources.files('cosmodiff.data') / 'IllustrisTNG_Mcdm.npy'
+# shape: (34, 32, 32, 32), dtype: float32
+DATA_N, DATA_NZ, DATA_NX, DATA_NY = 34, 32, 32, 32
 
 
 def _make_array(n=20, nz=4, nx=8, ny=8):
@@ -24,16 +35,14 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
-    arr = _make_array(n=20)
-    images, _ = load_data(arr, img_read_fn=None, norm=None, two_dim=False)
-    assert images.shape[0] == 20
+    images_all, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)
+    assert images_all.shape[0] == DATA_N
 
-    images, _ = load_data(arr, img_read_fn=None, n_samples=7, norm=None, two_dim=False)
-    assert images.shape[0] == 7
+    images_sub, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)
+    assert images_sub.shape[0] == 3
 
-    arr_t = torch.as_tensor(arr)
-    for i in range(len(images)):
-        assert any(torch.allclose(images[i], arr_t[j]) for j in range(len(arr_t)))
+    for i in range(len(images_sub)):
+        assert any(torch.allclose(images_sub[i], images_all[j]) for j in range(len(images_all)))
 
 
 def test_n_samples_labels_in_sync():
@@ -43,11 +52,11 @@ def test_n_samples_labels_in_sync():
     # labels encode each sample's original row index so we can verify alignment
     labels = np.arange(20)
 
-    images, out_labels = load_data(
+    images, out_labels, _ = load_data(
         arr, img_read_fn=None,
         label_path=labels, label_read_fn=None,
         n_samples=7, seed=0,
-        norm=None, two_dim=False,
+        normalization=None, two_dim=False,
     )
     assert images.shape[0] == 7
     assert out_labels.shape[0] == 7
@@ -59,23 +68,19 @@ def test_n_samples_labels_in_sync():
 
 
 def test_seed():
-    arr = _make_array(n=50)
-    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
-    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
-    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=99, norm=None, two_dim=False)
+    imgs1, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
+    imgs2, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
+    imgs3, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
 
 def test_memmap():
-    arr = _make_array(n=10)
-    with tempfile.NamedTemporaryFile(suffix=".npy") as f:
-        np.save(f.name, arr)
-        mmap = np.load(f.name, mmap_mode="r")
-        images_all, _ = load_data(mmap, img_read_fn=None, norm=None, two_dim=False)
-        images_sub, _ = load_data(mmap, img_read_fn=None, n_samples=5, norm=None, two_dim=False)
-    assert images_all.shape[0] == 10
-    assert images_sub.shape[0] == 5
+    mmap = np.load(DATA_PATH, mmap_mode="r")
+    images_all, _, _ = load_data(mmap, img_read_fn=None, normalization=None, two_dim=False)
+    images_sub, _, _ = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, two_dim=False)
+    assert images_all.shape[0] == DATA_N
+    assert images_sub.shape[0] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +102,161 @@ def test_array_dataset():
 
 
 # ---------------------------------------------------------------------------
-# minmax_norm / center_scale_norm
+# minmax_norm / center_max_norm / tanh_norm
 # ---------------------------------------------------------------------------
 
 def test_minmax_norm():
-    x = torch.randn(4, 8, 8)
-    out = minmax_norm(x)
+    # use non-negative data so the formula x *= 2/xmax is well-defined
+    x = torch.rand(4, 8, 8)
+    out, params = minmax_norm(x)
+    assert out.min().item() >= -1.0 - 1e-6
+    assert out.max().item() <= 1.0 + 1e-6
+    assert 'xmin' in params and 'xmax' in params
+
+
+def test_minmax_norm_inverse():
+    x = torch.rand(4, 8, 8)
+    out, params = minmax_norm(x)
+    recovered, _ = minmax_norm(out, inverse=True, **params)
+    assert torch.allclose(recovered, x, atol=1e-5)
+
+
+def test_minmax_norm_inplace():
+    x = torch.rand(4, 8, 8)
+    x_clone = x.clone()
+    out, _ = minmax_norm(x, inplace=True)
+    assert out.data_ptr() == x.data_ptr()
+    _, params2 = minmax_norm(x_clone)
+    assert torch.allclose(out, x_clone.sub(params2['xmin']).mul(2 / params2['xmax']).sub(1), atol=1e-5)
+
+
+def test_center_max_norm():
+    x = torch.randn(100)
+    out, params = center_max_norm(x.clone())
+    assert abs(out.mean().item()) < 0.1
+    assert out.abs().max().item() <= 1.0 + 1e-6
+    assert 'center' in params and 'xmax' in params
+
+
+def test_center_max_norm_inverse():
+    x = torch.randn(100)
+    out, params = center_max_norm(x.clone())
+    recovered, _ = center_max_norm(out, inverse=True, **params)
+    assert torch.allclose(recovered, x, atol=1e-5)
+
+
+def test_tanh_norm():
+    x = torch.randn(100)
+    out, params = tanh_norm(x)
+    assert out.shape == x.shape
+    assert set(params.keys()) == {'mu', 'alpha', 'beta', 'delta', 'gamma', 'sigma'}
+    # tanh output is strictly bounded by sigma * (-beta, alpha)
+    assert out.min().item() > -params['beta'] * params['sigma']
+    assert out.max().item() < params['alpha'] * params['sigma']
+
+
+def test_tanh_norm_sigma():
+    x = torch.randn(100)
+    out_default, _ = tanh_norm(x, sigma=1.0)
+    out_scaled, params = tanh_norm(x, sigma=2.0)
+    assert torch.allclose(out_scaled, out_default * 2.0, atol=1e-6)
+    assert params['sigma'] == 2.0
+
+
+def test_tanh_norm_inverse():
+    x = torch.randn(100) * 0.5  # keep within tanh saturation limits
+    out, params = tanh_norm(x)
+    recovered, _ = tanh_norm(out, inverse=True, **params)
+    assert torch.allclose(recovered, x, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Normalization class
+# ---------------------------------------------------------------------------
+
+def test_normalization_minmax():
+    x = torch.rand(10, 1, 8, 8)
+    norm = Normalization('min-max', inplace=False)
+    out = norm(x)
+    assert out is not None
+    assert out.shape == x.shape
     assert out.min().item() >= -1.0 - 1e-6
     assert out.max().item() <= 1.0 + 1e-6
 
 
-def test_center_scale_norm():
-    x = torch.randn(100)
-    out = center_scale_norm(x.clone())
-    assert abs(out.mean().item()) < 0.1
+def test_normalization_centermax():
+    x = torch.randn(10, 1, 8, 8)
+    norm = Normalization('center-max', inplace=False)
+    out = norm(x)
+    assert out is not None
+    assert out.shape == x.shape
     assert out.abs().max().item() <= 1.0 + 1e-6
+
+
+def test_normalization_inverse():
+    x = torch.rand(10, 1, 8, 8)
+    norm = Normalization('min-max', inplace=False)
+    out = norm(x)
+    recovered = norm.inverse(out)
+    assert torch.allclose(recovered, x, atol=1e-5)
+
+
+def test_normalization_tanh():
+    # tanh branch: minmax first, then tanh — output is strictly within sigma*(-beta, alpha)
+    x = torch.rand(10, 1, 8, 8)
+    norm = Normalization('tanh', inplace=False)
+    out = norm(x)
+    assert out.shape == x.shape
+    assert out.min().item() > -norm.kwargs['beta'] * norm.kwargs['sigma']
+    assert out.max().item() < norm.kwargs['alpha'] * norm.kwargs['sigma']
+    # params from both stages must be stored after forward
+    assert all(k in norm.kwargs for k in ('xmin', 'xmax', 'mu', 'alpha', 'beta', 'gamma', 'delta', 'sigma'))
+
+
+def test_normalization_tanh_inverse():
+    x = torch.rand(10, 1, 8, 8)
+    norm = Normalization('tanh', inplace=False)
+    out = norm(x)
+    recovered = norm.inverse(out)
+    assert torch.allclose(recovered, x, atol=1e-5)
+
+
+def test_normalization_params_fixed_when_given():
+    """Params supplied at init must not be overwritten by the forward pass."""
+    fixed_xmin = torch.tensor(0.0)
+    fixed_xmax = torch.tensor(2.0)
+    norm = Normalization('min-max', inplace=False, xmin=fixed_xmin, xmax=fixed_xmax)
+
+    # forward on data whose natural min/max differ from the fixed values
+    x = torch.rand(10, 1, 8, 8) * 10 + 5
+    norm(x)
+
+    assert torch.equal(norm.kwargs['xmin'], fixed_xmin), "xmin was overwritten"
+    assert torch.equal(norm.kwargs['xmax'], fixed_xmax), "xmax was overwritten"
+
+
+def test_normalization_params_inferred_on_first_forward():
+    """Params not supplied at init must be populated after the first forward pass."""
+    norm = Normalization('min-max', inplace=False)
+    assert 'xmin' not in norm.kwargs
+    assert 'xmax' not in norm.kwargs
+
+    x = torch.rand(10, 1, 8, 8)
+    norm(x)
+
+    assert 'xmin' in norm.kwargs, "xmin not set after first forward"
+    assert 'xmax' in norm.kwargs, "xmax not set after first forward"
+    assert torch.allclose(norm.kwargs['xmin'], x.min())
+    assert torch.allclose(norm.kwargs['xmax'], x.max())
+
+    # second forward on different data must reuse the inferred params, not recompute
+    y = torch.rand(10, 1, 8, 8) * 10 + 5
+    xmin_after_first = norm.kwargs['xmin'].clone()
+    xmax_after_first = norm.kwargs['xmax'].clone()
+    norm(y)
+
+    assert torch.equal(norm.kwargs['xmin'], xmin_after_first), "xmin changed on second forward"
+    assert torch.equal(norm.kwargs['xmax'], xmax_after_first), "xmax changed on second forward"
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +264,9 @@ def test_center_scale_norm():
 # ---------------------------------------------------------------------------
 
 def test_npy_read_fn():
-    arr = np.random.rand(5, 4, 8, 8).astype(np.float32)
-    with tempfile.NamedTemporaryFile(suffix=".npy") as f:
-        np.save(f.name, arr)
-        result = npy_read_fn(f.name)
-    assert result.shape == arr.shape
-    assert np.allclose(result, arr)
+    result = npy_read_fn(DATA_PATH)
+    assert result.shape == (DATA_N, DATA_NZ, DATA_NX, DATA_NY)
+    assert result.dtype == np.float32
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +334,65 @@ def test_parse_config_data():
             "keep_on_cpu": True,
         },
     }
-    dataset = parse_config_data(config)
+    dataset, norm = parse_config_data(config)
     assert len(dataset) == 6 * 4  # Nbatch * Nz slices
     item = dataset[0]
     assert "images" in item
     assert item["images"].shape == torch.Size([1, 8, 8])
+
+
+# ---------------------------------------------------------------------------
+# configs/config.yaml round-trip
+# ---------------------------------------------------------------------------
+
+def test_config_yaml_parse_model():
+    """parse_config_model must instantiate all four components from config.yaml."""
+    config = read_config(CONFIG_PATH)
+    config['global']['device'] = 'cpu'  # don't require GPU in CI
+
+    model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
+
+    assert type(model).__name__ == 'UNet2DModel'
+    assert model.config.sample_size == 64
+    assert model.config.in_channels == 1
+    assert model.config.out_channels == 1
+
+    assert type(optimizer).__name__ == 'AdamW'
+    assert abs(optimizer.param_groups[0]['lr'] - 1e-4) < 1e-10
+    assert abs(optimizer.param_groups[0]['weight_decay'] - 1e-2) < 1e-10
+
+    assert type(noise_scheduler).__name__ == 'DDPMScheduler'
+    assert noise_scheduler.config.num_train_timesteps == 1000
+
+    assert type(lr_scheduler).__name__ == 'ConstantLR'
+
+
+def test_config_yaml_parse_data():
+    """parse_config_data must build an ArrayDataset with the right shape,
+    normalization, and augmentation pipeline from config.yaml."""
+    from cosmodiff.augment import RandomRoll, RandomFlip
+
+    config = read_config(CONFIG_PATH)
+    config['global']['device'] = 'cpu'
+
+    cfg = copy.deepcopy(config)
+    cfg['data']['img_path'] = str(DATA_PATH)
+    cfg['data']['label_path'] = None
+    cfg['data']['keep_on_cpu'] = True
+
+    dataset, norm = parse_config_data(cfg)
+
+    zthin = config['data']['zthin']
+    assert isinstance(dataset, ArrayDataset)
+    assert len(dataset) == DATA_N * (DATA_NZ // zthin)
+    item = dataset[0]
+    assert 'images' in item
+    assert item['images'].shape == torch.Size([1, DATA_NX, DATA_NY])
+
+    assert isinstance(norm, Normalization)
+    assert norm.method == config['data']['normalization']
+
+    assert dataset.augmentations is not None
+    aug_types = [type(t) for t in dataset.augmentations]
+    assert RandomRoll in aug_types
+    assert RandomFlip in aug_types
