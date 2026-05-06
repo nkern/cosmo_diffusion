@@ -526,13 +526,14 @@ def parse_config_data(config: dict):
     n_samples = data_cfg.get("n_samples", None)
     seed = data_cfg.get("seed", None)
     log = data_cfg.get("log", False)
+    normalization = data_cfg.get('normalization', None)
+    norm_kwargs = data_cfg.get('norm_kwargs', {})
 
     _load_kwargs = dict(
         img_read_fn=img_read_fn,
         device=device,
         dtype=dtype,
         label_read_fn=label_read_fn,
-        normalization=data_cfg.get("norm", 'center-max'),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
     )
@@ -543,16 +544,21 @@ def parse_config_data(config: dict):
         n_samples_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
         seeds_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
         log_list = log if isinstance(log, (list, tuple)) else [log] * n
+        norm_list = normalization if isinstance(normalization, (list, tuple)) else [normalization] * n
+        nk_list = norm_kwargs if isinstance(norm_kwargs, (list, tuple)) else [norm_kwargs] * n
 
         all_images, all_labels = [], []
-        for p, lp, ns, sd, lg in zip(img_path, label_paths, n_samples_list, seeds_list, log_list):
-            imgs, lbls, norm = load_data(img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, **_load_kwargs)
+        for p, lp, ns, sd, lg, nm, nk in zip(img_path, label_paths, n_samples_list, seeds_list, log_list, norm_list, nk_list):
+            imgs, lbls, norm = load_data(
+                img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, normalization=nm, norm_kwargs=nk, **_load_kwargs
+                )
             all_images.append(imgs)
             if lbls is not None:
                 all_labels.append(lbls)
 
         images = torch.cat(all_images, dim=0)
         labels = torch.cat(all_labels, dim=0) if all_labels else None
+
     else:
         images, labels, norm = load_data(
             img_path=img_path,
@@ -560,6 +566,8 @@ def parse_config_data(config: dict):
             n_samples=n_samples,
             seed=seed,
             log=log,
+            normalization=normalization,
+            norm_kwargs=norm_kwargs,
             **_load_kwargs,
         )
 
