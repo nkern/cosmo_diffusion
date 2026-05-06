@@ -45,6 +45,8 @@ def train(
     pin_memory: bool = False,
     cfg_dropout: float = 0.0,
     conditioning: str = 'discrete',
+    ema_sigma_rels: Optional[tuple] = None,
+    ema_update_every: int = 100,
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -111,6 +113,18 @@ def train(
             labels via ``encoder_hidden_states=`` (e.g.
             ``UNet2DConditionModel``); labels of shape ``(B, D)`` are
             automatically unsqueezed to ``(B, 1, D)``.
+        ema_sigma_rels (tuple of float, optional): If set, enables post-hoc
+            EMA tracking via ``ema-pytorch``.  Two values are required (e.g.
+            ``(0.05, 0.28)``); they control the two power-function EMA
+            profiles checkpointed at each epoch.  After training,
+            ``ema.synthesize_ema_model(sigma_rel=...)`` reconstructs any
+            target profile from those snapshots.  ``None`` (default) disables
+            EMA entirely.
+        ema_update_every (int): How often (in optimizer steps) to update the
+            EMA profiles.  Defaults to ``100``, matching the ``ema-pytorch``
+            default and suitable for large models where per-step EMA is
+            expensive.  Set to ``1`` for small models or short training runs
+            to ensure the EMA is updated at every step.
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -220,6 +234,19 @@ def train(
     if resume_from_checkpoint is not None:
         accelerator.load_state(resume_from_checkpoint)
 
+    # post-hoc EMA (fresh each run; not restored on resume)
+    ema = None
+    if ema_sigma_rels is not None:
+        from pathlib import Path
+        from ema_pytorch import PostHocEMA
+        ema = PostHocEMA(
+            accelerator.unwrap_model(model),
+            sigma_rels=ema_sigma_rels,
+            checkpoint_every_num_steps='manual',
+            checkpoint_folder=Path(output_dir) / 'ema',
+            update_every=ema_update_every,
+        )
+
     # null token for CFG label dropout (class_labels mode only)
     cfg_null_token = None
     if cfg_dropout > 0.0 and conditioning == 'discrete':
@@ -307,6 +334,9 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
+            if ema is not None:
+                ema.update()
+
             lr_scheduler.step()
             batch_time = time.time() - t0
             batch_loss = loss.detach().item()
@@ -359,12 +389,19 @@ def train(
                         "class": f"{raw_sched.__class__.__module__}.{raw_sched.__class__.__name__}",
                         "kwargs": utils._get_lr_scheduler_kwargs(raw_sched),
                     },
+                    "ema_sigma_rels": list(ema_sigma_rels) if ema_sigma_rels is not None else None,
                 }
                 with open(os.path.join(ckpt_save_path, "checkpoint_config.yaml"), "w") as f:
                     yaml.dump(_to_yaml_safe(ckpt_cfg), f)
 
                 # Model weights (via hook) + optimizer moments + grad scaler + RNG
                 accelerator.save_state(ckpt_save_path)
+
+                if ema is not None:
+                    from pathlib import Path
+                    ema.checkpoint_folder = Path(ckpt_save_path) / 'ema'
+                    ema.checkpoint_folder.mkdir(exist_ok=True)
+                    ema.checkpoint()
 
                 if hasattr(dataset, "augmentations") and dataset.augmentations is not None:
                     with open(os.path.join(ckpt_save_path, "augmentations.pkl"), "wb") as f:
@@ -377,7 +414,7 @@ def train(
                     accelerator.print(f"Checkpoint saved → {ckpt_save_path}")
 
     accelerator.end_training()
-    return metrics
+    return {'metrics': metrics, 'ema': ema}
 
 
 @torch.no_grad()
@@ -482,6 +519,156 @@ def generate(
         images = renorm(images)
 
     return images
+
+
+def gamma_from_sigma_rel(sigma_rel: float) -> float:
+    """Convert a sigma_rel value to the corresponding power-function EMA exponent gamma.
+
+    The power-function EMA assigns weight ``w(x) = (gamma+1) * x^gamma`` to
+    training progress ``x = s/t`` in ``[0, 1]``.  ``sigma_rel`` is the
+    standard deviation of that distribution and is also equal to the relative
+    EMA length (fraction of training): ``sigma_rel=0.1`` means the EMA draws
+    its weight from roughly the last 10% of training (Karras et al. 2024,
+    Sec. 3.1).
+
+    Args:
+        sigma_rel: relative standard deviation of the EMA kernel (e.g. 0.05 or 0.28).
+
+    Returns:
+        Corresponding gamma exponent.
+    """
+    from scipy.optimize import brentq
+
+    def _f(gamma):
+        mean = (gamma + 1) / (gamma + 2)
+        second_moment = (gamma + 1) / (gamma + 3)
+        return np.sqrt(second_moment - mean ** 2) - sigma_rel
+
+    return brentq(_f, 1e-4, 1e4)
+
+
+def compute_ema_profiles(
+    sigma_rels_train: tuple,
+    checkpoint_epochs: list,
+    total_epochs: int,
+    sigma_rel_target: float,
+) -> dict:
+    """Compute per-checkpoint and synthesized EMA weight profiles.
+
+    Implements the analysis behind Fig. 4 of Karras et al. 2024.  For each
+    ``(checkpoint_epoch, sigma_rel)`` pair a basis profile is computed; the
+    synthesized profile is the non-negative least-squares combination that
+    best approximates the target profile.
+
+    Args:
+        sigma_rels_train: sigma_rel values used during training (e.g. ``(0.05, 0.28)``).
+        checkpoint_epochs: epochs at which ``ema.checkpoint()`` was called.
+        total_epochs: total training length (defines the target profile).
+        sigma_rel_target: target sigma_rel to synthesize (e.g. ``0.15``).
+
+    Returns:
+        dict with keys:
+            ``'epochs'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'basis'``: list of ``(checkpoint_epoch, sigma_rel, weights)`` tuples
+            ``'target'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'synthesized'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'coefficients'``: ``np.ndarray`` of shape ``(n_basis,)``
+    """
+    from scipy.optimize import nnls
+
+    epochs = np.arange(1, total_epochs + 1)
+    gammas_train = [gamma_from_sigma_rel(s) for s in sigma_rels_train]
+    gamma_target = gamma_from_sigma_rel(sigma_rel_target)
+
+    basis = []
+    for t_i in checkpoint_epochs:
+        for gamma_j, s_j in zip(gammas_train, sigma_rels_train):
+            w = np.where(epochs <= t_i, (epochs / t_i) ** gamma_j, 0.0)
+            if w.sum() > 0:
+                w = w / w.sum()
+            basis.append((t_i, s_j, w))
+
+    w_target = (epochs / total_epochs) ** gamma_target
+    w_target = w_target / w_target.sum()
+
+    B = np.column_stack([w for _, _, w in basis])
+    coeffs, _ = nnls(B, w_target)
+    if coeffs.sum() > 0:
+        coeffs = coeffs / coeffs.sum()
+    w_synth = B @ coeffs
+
+    return {
+        'epochs': epochs,
+        'basis': basis,
+        'target': w_target,
+        'synthesized': w_synth,
+        'coefficients': coeffs,
+    }
+
+
+def synthesize_ema_from_checkpoints(
+    model: torch.nn.Module,
+    output_dir: str,
+    sigma_rel_target: float,
+    sigma_rels: Optional[tuple] = None,
+    up_to_epoch: Optional[int] = None,
+) -> torch.nn.Module:
+    """Synthesize a post-hoc EMA model by pooling snapshots across checkpoints.
+
+    Gathers all ``.pt`` EMA snapshot files from every ``checkpoint-epoch-*/ema/``
+    subdirectory in ``output_dir`` into a single temporary directory (via
+    symlinks) and delegates synthesis to ``PostHocEMA``.
+
+    ``sigma_rels`` is read automatically from ``checkpoint_config.yaml`` if not
+    supplied explicitly.
+
+    Args:
+        model: the nn.Module used during training (needed for parameter structure).
+        output_dir: root training directory containing ``checkpoint-epoch-*`` dirs.
+        sigma_rel_target: target EMA profile to synthesize, e.g. ``0.15``.
+        sigma_rels: sigma_rel values used during training, e.g. ``(0.05, 0.28)``.
+            If ``None``, read from the latest checkpoint's ``checkpoint_config.yaml``.
+        up_to_epoch: if set, only use checkpoints at or before this epoch number.
+
+    Returns:
+        Synthesized nn.Module with EMA weights.
+    """
+    import tempfile
+    from pathlib import Path
+    from ema_pytorch import PostHocEMA
+
+    ckpt_dirs = sorted(Path(output_dir).glob('checkpoint-epoch-*'))
+    if up_to_epoch is not None:
+        ckpt_dirs = [d for d in ckpt_dirs if int(d.name.split('-')[-1]) <= up_to_epoch]
+
+    if not ckpt_dirs:
+        raise ValueError(f"No checkpoints found in {output_dir}")
+
+    if sigma_rels is None:
+        cfg_path = ckpt_dirs[-1] / 'checkpoint_config.yaml'
+        with open(cfg_path) as f:
+            ckpt_cfg = yaml.safe_load(f)
+        sigma_rels = ckpt_cfg.get('ema_sigma_rels')
+        if sigma_rels is None:
+            raise ValueError(
+                "sigma_rels not found in checkpoint_config.yaml — "
+                "pass sigma_rels explicitly or retrain with ema_sigma_rels set."
+            )
+        sigma_rels = tuple(sigma_rels)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        for ckpt_dir in ckpt_dirs:
+            for pt_file in (ckpt_dir / 'ema').glob('*.pt'):
+                (tmp_path / pt_file.name).symlink_to(pt_file.resolve())
+
+        ema = PostHocEMA(
+            model,
+            sigma_rels=sigma_rels,
+            checkpoint_folder=tmp_path,
+            checkpoint_every_num_steps='manual',
+        )
+        return ema.synthesize_ema_model(sigma_rel=sigma_rel_target)
 
 
 class PCAEncoder(torch.nn.Module):

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel, PixArtTransformer2DModel
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
-from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
+from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder, synthesize_ema_from_checkpoints, compute_ema_profiles
 from cosmodiff.augment import RandomRoll, RandomFlip
 from cosmodiff.data import DATA_PATH
 
@@ -33,7 +33,7 @@ def test_train_basic():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         initial_weights = model.conv_in.weight.data.clone()
-        metrics = train(
+        result = train(
             dataset,
             model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
@@ -55,8 +55,8 @@ def test_train_basic():
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(model.conv_in.weight.data, initial_weights)
 
         # load_checkpoint
@@ -72,7 +72,7 @@ def test_train_basic():
 
         # continue training from checkpoint
         initial_weights = model.conv_in.weight.data.clone()
-        metrics = train(
+        result = train(
             dataset,
             resume_from_checkpoint=ckpt_path,
             num_epochs=2,
@@ -92,8 +92,8 @@ def test_train_basic():
         )
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(_model2.conv_in.weight.data, initial_weights)
 
 
@@ -118,7 +118,7 @@ def test_train_conditional_dit():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         initial_weights = model.transformer_blocks[0].ff.net[0].proj.weight.clone()
-        metrics = train(
+        result = train(
             dataset,
             model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
@@ -140,8 +140,8 @@ def test_train_conditional_dit():
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(model.transformer_blocks[0].ff.net[0].proj.weight, initial_weights)
 
         # load_checkpoint
@@ -367,7 +367,7 @@ def test_train_cfg_class_labels():
     dataset = ArrayDataset(images, labels=labels)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        metrics = train(
+        result = train(
             dataset, model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
             num_epochs=1,
@@ -380,7 +380,7 @@ def test_train_cfg_class_labels():
             cfg_dropout=0.5,
             conditioning='discrete',
         )
-    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
 
 
 def test_train_encoder_hidden_states():
@@ -392,7 +392,7 @@ def test_train_encoder_hidden_states():
     model = _make_unet_condition(n_params=N_PARAMS)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        metrics = train(
+        result = train(
             dataset, model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
             num_epochs=1,
@@ -404,7 +404,7 @@ def test_train_encoder_hidden_states():
             verbose=False,
             conditioning='continuous',
         )
-    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
 
 
 def test_generate_encoder_hidden_states():
@@ -464,7 +464,7 @@ def test_train_pixart():
     model = _make_pixart()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        metrics = train(
+        result = train(
             dataset, model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
             num_epochs=1,
@@ -476,7 +476,7 @@ def test_train_pixart():
             verbose=False,
             conditioning='continuous',
         )
-    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
 
 
 def test_generate_pixart():
@@ -494,3 +494,96 @@ def test_generate_pixart():
     )
     assert images.shape == (3, 1, 8, 8)
     assert torch.isfinite(images).all()
+
+
+# ------------------------------------------------------------------ #
+# EMA tests                                                            #
+# ------------------------------------------------------------------ #
+
+def test_train_ema():
+    """train() with ema_sigma_rels checkpoints EMA profiles and returns ema object."""
+    model = _make_unet()
+    images = torch.randn(8, 1, 8, 8)
+    dataset = ArrayDataset(images)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+            ema_update_every=1,
+        )
+
+        assert result['ema'] is not None
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+
+        # EMA profiles should be checkpointed inside the epoch checkpoint dir
+        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
+        assert os.path.isdir(os.path.join(ckpt_path, 'ema'))
+
+        # should be able to synthesize a new EMA profile post-hoc
+        synthesized = result['ema'].synthesize_ema_model(sigma_rel=0.15)
+        assert synthesized is not None
+
+
+def test_train_ema_multi_checkpoint_synthesis():
+    """Multi-checkpoint pooling reduces synthesis residual and produces distinct models.
+
+    Tests two properties from Karras et al. 2024:
+    1. More checkpoints → smaller ||w_synth - w_target|| (better approximation).
+    2. Different sigma_rel targets → different synthesized model weights.
+    """
+    import glob
+
+    sigma_rels_train = (0.05, 0.28)
+    sigma_rel_target = 0.15
+    num_epochs = 9
+    checkpoint_every = 3
+    checkpoint_epochs = list(range(checkpoint_every - 1, num_epochs, checkpoint_every))
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=num_epochs,
+            batch_size=4,
+            checkpoint_every_n_epochs=checkpoint_every,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            ema_sigma_rels=sigma_rels_train,
+            ema_update_every=1,
+        )
+
+        assert len(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*'))) == 3
+
+        # 1. more checkpoints → smaller synthesis residual
+        profiles_one = compute_ema_profiles(
+            sigma_rels_train, checkpoint_epochs[:1], num_epochs, sigma_rel_target
+        )
+        profiles_all = compute_ema_profiles(
+            sigma_rels_train, checkpoint_epochs, num_epochs, sigma_rel_target
+        )
+        residual_one = np.sum((profiles_one['synthesized'] - profiles_one['target']) ** 2)
+        residual_all = np.sum((profiles_all['synthesized'] - profiles_all['target']) ** 2)
+        assert residual_all < residual_one, \
+            f"expected residual to decrease with more checkpoints: {residual_one:.6f} → {residual_all:.6f}"
+
+        # 2. different sigma_rel targets → different synthesized model weights
+        synth_lo = synthesize_ema_from_checkpoints(model, tmp_dir, sigma_rel_target=0.05)
+        synth_hi = synthesize_ema_from_checkpoints(model, tmp_dir, sigma_rel_target=0.28)
+        params_lo = torch.cat([p.flatten() for p in synth_lo.parameters()])
+        params_hi = torch.cat([p.flatten() for p in synth_hi.parameters()])
+        assert not torch.equal(params_lo, params_hi), \
+            "sigma_rel=0.05 and sigma_rel=0.28 produced identical model weights"

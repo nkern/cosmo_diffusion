@@ -79,7 +79,7 @@ def main():
 
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
-        metrics = train(
+        result = train(
             dataset,
             resume_from_checkpoint=latest_ckpt,
             output_dir=output_dir,
@@ -89,7 +89,7 @@ def main():
     else:
         print("No checkpoint found, training from scratch.")
         model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
-        metrics = train(
+        result = train(
             dataset,
             model,
             optimizer=optimizer,
@@ -100,11 +100,11 @@ def main():
         )
 
     print(f"Training complete.")
-    print(f"Final epoch loss: {metrics['epoch_loss'][-1]:.4f}")
-    print(f"Total time: {sum(metrics['epoch_times']):.1f}s")
+    print(f"Final epoch loss: {result['metrics']['epoch_loss'][-1]:.4f}")
+    print(f"Total time: {sum(result['metrics']['epoch_times']):.1f}s")
 
     metrics_path = os.path.join(
-        output_dir, "metrics_epoch_{:04d}.json".format(len(metrics["epoch_loss"]) - 1)
+        output_dir, "metrics_epoch_{:04d}.json".format(len(result['metrics']["epoch_loss"]) - 1)
     )
     write_metrics(metrics, metrics_path)
     print(f"Metrics written to {metrics_path}")

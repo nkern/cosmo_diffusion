@@ -29,6 +29,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "coverage",
+    "ema-pytorch",
 ]
 docs = [
     "cosmodiff[dev]",

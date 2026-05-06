@@ -668,8 +668,8 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     Example::
 
         # from dict
-        metrics = train(dataset, model)
-        plot_metrics(metrics, show=True)
+        result = train(dataset, model)
+        plot_metrics(result['metrics'], show=True)
 
         # from file
         plot_metrics("output/metrics_epoch_49.json", save_dir="output/plots")
@@ -738,6 +738,42 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     #plt.close(fig)
 
     return fig1, fig2, fig3
+
+
+def plot_ema_profiles(profiles: dict, ax=None):
+    """Plot per-checkpoint and synthesized EMA weight profiles.
+
+    Takes the dict returned by ``cosmodiff.optim.compute_ema_profiles`` and
+    produces a figure analogous to Fig. 4 of Karras et al. 2024.
+
+    Args:
+        profiles: output of ``compute_ema_profiles``.
+        ax: existing Axes to draw on; creates a new figure if ``None``.
+
+    Returns:
+        matplotlib Axes.
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    epochs = profiles['epochs']
+
+    for t_i, s_j, w in profiles['basis']:
+        ax.plot(epochs, w, color='steelblue', alpha=0.4, linewidth=0.8,
+                label=rf'checkpoint epoch {t_i}, $\sigma_{{rel}}$={s_j}')
+
+    ax.plot(epochs, profiles['target'], 'k--', linewidth=1.5,
+            label=r'target profile')
+    ax.plot(epochs, profiles['synthesized'], 'r-', linewidth=2,
+            label=r'synthesized profile')
+
+    ax.set_xlabel('Training epoch')
+    ax.set_ylabel('EMA weight (normalized)')
+    ax.legend(fontsize=7)
+
+    return fig
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
