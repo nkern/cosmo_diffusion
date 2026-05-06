@@ -773,7 +773,7 @@ def plot_ema_profiles(profiles: dict, ax=None):
     ax.set_ylabel('EMA weight (normalized)')
     ax.legend(fontsize=7)
 
-    return fig
+    return ax
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
