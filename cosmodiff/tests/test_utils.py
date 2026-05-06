@@ -1,8 +1,6 @@
 import copy
-import importlib.resources
 import json
 import tempfile
-from pathlib import Path
 import numpy as np
 import torch
 from cosmodiff.utils import (
@@ -19,9 +17,10 @@ from cosmodiff.utils import (
     write_metrics,
     read_metrics,
 )
+from cosmodiff.data import DATA_PATH
 
-CONFIG_PATH = importlib.resources.files('cosmodiff.data') / 'config.yaml'
-DATA_PATH = importlib.resources.files('cosmodiff.data') / 'IllustrisTNG_Mcdm.npy'
+CONFIG_PATH = DATA_PATH / 'config.yaml'
+SIM_PATH = DATA_PATH / 'IllustrisTNG_Mcdm.npy'
 # shape: (34, 32, 32, 32), dtype: float32
 DATA_N, DATA_NZ, DATA_NX, DATA_NY = 34, 32, 32, 32
 
@@ -35,10 +34,10 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
-    images_all, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)
+    images_all, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)
     assert images_all.shape[0] == DATA_N
 
-    images_sub, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)
+    images_sub, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)
     assert images_sub.shape[0] == 3
 
     for i in range(len(images_sub)):
@@ -68,15 +67,15 @@ def test_n_samples_labels_in_sync():
 
 
 def test_seed():
-    imgs1, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
-    imgs2, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
-    imgs3, _, _ = load_data(DATA_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)
+    imgs1, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
+    imgs2, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
+    imgs3, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
 
 def test_memmap():
-    mmap = np.load(DATA_PATH, mmap_mode="r")
+    mmap = np.load(SIM_PATH, mmap_mode="r")
     images_all, _, _ = load_data(mmap, img_read_fn=None, normalization=None, two_dim=False)
     images_sub, _, _ = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, two_dim=False)
     assert images_all.shape[0] == DATA_N
@@ -265,7 +264,7 @@ def test_normalization_params_inferred_on_first_forward():
 # ---------------------------------------------------------------------------
 
 def test_npy_read_fn():
-    result = npy_read_fn(DATA_PATH)
+    result = npy_read_fn(SIM_PATH)
     assert result.shape == (DATA_N, DATA_NZ, DATA_NX, DATA_NY)
     assert result.dtype == np.float32
 
@@ -377,7 +376,7 @@ def test_config_yaml_parse_data():
     config['global']['device'] = 'cpu'
 
     cfg = copy.deepcopy(config)
-    cfg['data']['img_path'] = str(DATA_PATH)
+    cfg['data']['img_path'] = str(SIM_PATH)
     cfg['data']['label_path'] = None
     cfg['data']['keep_on_cpu'] = True
 

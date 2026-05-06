@@ -43,6 +43,8 @@ def train(
     max_grad_norm: float = 1.0,
     force_cpu: bool = False,
     pin_memory: bool = False,
+    cfg_dropout: float = 0.0,
+    conditioning: str = 'discrete',
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -98,6 +100,17 @@ def train(
             ``1.0``.
         force_cpu (bool): Force the model to the CPU even if CUDA available
         pin_memory (bool): pin dataset memory if on CPU
+        cfg_dropout (float): Fraction of training batches where labels are
+            replaced with a null token (``class_labels`` mode) or zeros
+            (``encoder_hidden_states`` mode) for classifier-free guidance
+            training. Set to ``0.0`` (default) to disable CFG.
+        conditioning (str): How labels are passed to the model.
+            ``'discrete'`` (default) passes integer labels via
+            ``class_labels=`` (e.g. ``UNet2DModel`` with ``num_class_embeds``
+            or ``DiTTransformer2DModel``).  ``'continuous'`` passes float
+            labels via ``encoder_hidden_states=`` (e.g.
+            ``UNet2DConditionModel``); labels of shape ``(B, D)`` are
+            automatically unsqueezed to ``(B, 1, D)``.
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -207,6 +220,11 @@ def train(
     if resume_from_checkpoint is not None:
         accelerator.load_state(resume_from_checkpoint)
 
+    # null token for CFG label dropout (class_labels mode only)
+    cfg_null_token = None
+    if cfg_dropout > 0.0 and conditioning == 'discrete':
+        cfg_null_token = accelerator.unwrap_model(model).config.num_class_embeds - 1
+
     # ------------------------------------------------------------------ #
     # 5.  Training loop                                                    #
     # ------------------------------------------------------------------ #
@@ -235,6 +253,13 @@ def train(
         for batch in progress:
             images = batch["images"]
             labels = batch.get("labels", None)
+            if labels is not None and cfg_dropout > 0.0:
+                drop_mask = torch.rand(labels.shape[0], device=labels.device) < cfg_dropout
+                if conditioning == 'discrete':
+                    labels = torch.where(drop_mask, torch.full_like(labels, cfg_null_token), labels)
+                else:
+                    mask = drop_mask.view(-1, *([1] * (labels.ndim - 1)))
+                    labels = torch.where(mask, torch.zeros_like(labels), labels)
 
             t0 = time.time()
 
@@ -252,18 +277,16 @@ def train(
                 # --- predict noise --------------------------------------
                 with accelerator.autocast():
                     if labels is not None:
-                        pred = model(
-                            noisy_images,
-                            timestep=timesteps,
-                            class_labels=labels,
-                            return_dict=False,
-                        )[0]
+                        if conditioning == 'discrete':
+                            cond_kwargs = {'class_labels': labels}
+                        else:
+                            cond = labels.float()
+                            if cond.ndim == 2:
+                                cond = cond.unsqueeze(1)
+                            cond_kwargs = {'encoder_hidden_states': cond}
+                        pred = model(noisy_images, timestep=timesteps, return_dict=False, **cond_kwargs)[0]
                     else:
-                        pred = model(
-                            noisy_images,
-                            timesteps,
-                            return_dict=False,
-                        )[0]
+                        pred = model(noisy_images, timesteps, return_dict=False)[0]
 
                     prediction_type = noise_scheduler.config.prediction_type
                     if prediction_type == 'epsilon':
@@ -364,6 +387,8 @@ def generate(
     batch_size: int = 1,
     image_shape: tuple[int, ...] = (1, 64, 64),
     labels: Optional[torch.Tensor] = None,
+    guidance_scale: Optional[float] = None,
+    conditioning: str = 'discrete',
     ddim_thinning: Optional[int] = None,
     renorm: Optional[Callable] = None,
     device: Optional[torch.device] = None,
@@ -381,9 +406,18 @@ def generate(
             any compatible scheduler with ``set_timesteps`` and ``step``).
         batch_size (int): Number of images to generate.
         image_shape (tuple): Shape of each image ``(C, H, W)``.
-        labels (array-like, optional): Class indices of length ``batch_size``.
-            Required for class-conditional models (e.g. DiTTransformer2DModel);
-            ignored otherwise.
+        labels (array-like, optional): Conditioning labels of length
+            ``batch_size``.  Integer class indices for ``'class_labels'`` mode;
+            float array of shape ``(batch_size, D)`` for
+            ``'encoder_hidden_states'`` mode.
+        guidance_scale (float, optional): Classifier-free guidance scale.
+            ``None`` (default) uses the plain conditional prediction with no
+            amplification.  A float in ``[1.0, 15.0]`` runs a double forward
+            pass with null labels and controls class adherence:
+            ``uncond + scale * (cond - uncond)``.
+        conditioning (str): Matches the mode used during training.
+            ``'discrete'`` (default) for integer class labels;
+            ``'continuous'`` for continuous float labels.
         ddim_thinning (int, optional): Thinning factor relative to
             ``num_train_timesteps``. E.g. ``ddim_thinning=10`` with 1000
             training steps runs 100 inference steps. Only meaningful with
@@ -415,18 +449,30 @@ def generate(
     )
 
     if labels is not None:
-        labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+        if conditioning == 'discrete':
+            labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+        else:
+            labels = torch.as_tensor(labels, dtype=torch.float, device=device)
+            if labels.ndim == 2:
+                labels = labels.unsqueeze(1)  # (B, D) -> (B, 1, D)
+
+    null_labels = None
+    if labels is not None and guidance_scale is not None:
+        if conditioning == 'discrete':
+            null_token = model.config.num_class_embeds - 1
+            null_labels = torch.full_like(labels, null_token)
+        else:
+            null_labels = torch.zeros_like(labels)
 
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
         timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
 
         if labels is not None:
-            pred = model(
-                images,
-                timestep=timesteps,
-                class_labels=labels,
-                return_dict=False,
-            )[0]
+            cond_key = 'class_labels' if conditioning == 'discrete' else 'encoder_hidden_states'
+            pred = model(images, timestep=timesteps, return_dict=False, **{cond_key: labels})[0]
+            if null_labels is not None:
+                uncond_pred = model(images, timestep=timesteps, return_dict=False, **{cond_key: null_labels})[0]
+                pred = uncond_pred + guidance_scale * (pred - uncond_pred)
         else:
             pred = model(images, timesteps, return_dict=False)[0]
 

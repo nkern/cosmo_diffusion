@@ -2,10 +2,16 @@ import os
 import tempfile
 import numpy as np
 import torch
-from diffusers import UNet2DModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
+from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
 from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
 from cosmodiff.augment import RandomRoll, RandomFlip
+from cosmodiff.data import DATA_PATH
+
+SIM_PATH = DATA_PATH / 'IllustrisTNG_Mcdm.npy'
+PARAMS_PATH = DATA_PATH / 'params_Illustris.txt'
+# shape: (34,) simulations × 6 cosmological parameters (a,b,c,d,e,f)
+N_SIMS, N_PARAMS = 34, 6
 
 
 def test_train_basic():
@@ -163,6 +169,36 @@ def _make_unet(sample_size=8):
     )
 
 
+def _make_unet_class_cond(n_classes=4, sample_size=8):
+    return UNet2DModel(
+        sample_size=sample_size,
+        in_channels=1,
+        out_channels=1,
+        layers_per_block=1,
+        block_out_channels=(16, 16),
+        down_block_types=("DownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "UpBlock2D"),
+        norm_num_groups=8,
+        num_class_embeds=n_classes + 1,  # last index is the null token
+    )
+
+
+def _make_unet_condition(sample_size=8, n_params=2):
+    return UNet2DConditionModel(
+        sample_size=sample_size,
+        in_channels=1,
+        out_channels=1,
+        layers_per_block=1,
+        block_out_channels=(16, 16),
+        down_block_types=("DownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "UpBlock2D"),
+        norm_num_groups=8,
+        cross_attention_dim=16,
+        encoder_hid_dim=n_params,
+        encoder_hid_dim_type="text_proj",
+    )
+
+
 def test_generate_ddpm():
     """generate() returns the right shape and finite values with DDPMScheduler."""
     model = _make_unet()
@@ -302,4 +338,103 @@ def test_kid_smaller_same_dist():
     assert kid_same < kid_diff
 
 
+# ------------------------------------------------------------------ #
+# CFG / conditioning tests                                             #
+# ------------------------------------------------------------------ #
+
+def test_train_cfg_class_labels():
+    """train() with cfg_dropout runs without error and produces finite loss."""
+    n_classes = 4
+    model = _make_unet_class_cond(n_classes=n_classes)
+    images = torch.randn(8, 1, 8, 8)
+    labels = torch.randint(0, n_classes, (8,))
+    dataset = ArrayDataset(images, labels=labels)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        metrics = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            cfg_dropout=0.5,
+            conditioning='discrete',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+
+
+def test_train_encoder_hidden_states():
+    """train() with conditioning='continuous' using real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    images = torch.randn(len(params), 1, 8, 8)
+    labels = torch.as_tensor(params)  # (34, 6)
+    dataset = ArrayDataset(images, labels=labels)
+    model = _make_unet_condition(n_params=N_PARAMS)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        metrics = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            conditioning='continuous',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+
+
+def test_generate_encoder_hidden_states():
+    """generate() with conditioning='continuous' using real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    model = _make_unet_condition(n_params=N_PARAMS)
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    # use first 3 simulations' parameters as conditioning
+    labels = torch.as_tensor(params[:3])  # (3, 6)
+
+    images = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels,
+        conditioning='continuous',
+    )
+    assert images.shape == (3, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_cfg_guidance_scale():
+    """guidance_scale != 1.0 produces different output than guidance_scale=1.0."""
+    n_classes = 4
+    model = _make_unet_class_cond(n_classes=n_classes)
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    labels = torch.tensor([0, 1, 2])
+
+    g1 = torch.Generator().manual_seed(0)
+    out_no_cfg = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels, guidance_scale=None,
+        conditioning='discrete',
+        generator=g1,
+    )
+
+    g2 = torch.Generator().manual_seed(0)
+    out_cfg = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels, guidance_scale=2.0,
+        conditioning='discrete',
+        generator=g2,
+    )
+
+    assert out_no_cfg.shape == out_cfg.shape == (3, 1, 8, 8)
+    assert torch.isfinite(out_cfg).all()
+    assert not torch.allclose(out_no_cfg, out_cfg)
 

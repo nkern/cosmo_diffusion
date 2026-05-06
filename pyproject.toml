@@ -51,5 +51,5 @@ filterwarnings = ["ignore::DeprecationWarning"]
 script-files = ["scripts/cosmodiff_train.py"]
 
 [tool.setuptools.package-data]
-"cosmodiff.data" = ["*.npy", "*.yaml"]
+"cosmodiff.data" = ["*.npy", "*.yaml", "*.txt"]
 
