@@ -2,7 +2,7 @@ import os
 import tempfile
 import numpy as np
 import torch
-from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
+from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel, PixArtTransformer2DModel
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
 from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
 from cosmodiff.augment import RandomRoll, RandomFlip
@@ -196,6 +196,22 @@ def _make_unet_condition(sample_size=8, n_params=2):
         cross_attention_dim=16,
         encoder_hid_dim=n_params,
         encoder_hid_dim_type="text_proj",
+    )
+
+
+def _make_pixart(sample_size=8, n_params=N_PARAMS):
+    return PixArtTransformer2DModel(
+        sample_size=sample_size,
+        patch_size=2,
+        in_channels=1,
+        out_channels=1,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        cross_attention_dim=16,
+        caption_channels=n_params,
+        use_additional_conditions=False,
+        norm_num_groups=None,
     )
 
 
@@ -438,3 +454,43 @@ def test_generate_cfg_guidance_scale():
     assert torch.isfinite(out_cfg).all()
     assert not torch.allclose(out_no_cfg, out_cfg)
 
+
+def test_train_pixart():
+    """train() with PixArtTransformer2DModel and real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    images = torch.randn(len(params), 1, 8, 8)
+    labels = torch.as_tensor(params)
+    dataset = ArrayDataset(images, labels=labels)
+    model = _make_pixart()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        metrics = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            conditioning='continuous',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
+
+
+def test_generate_pixart():
+    """generate() with PixArtTransformer2DModel and real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)
+    model = _make_pixart()
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    labels = torch.as_tensor(params[:3])  # (3, 6)
+
+    images = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels,
+        conditioning='continuous',
+    )
+    assert images.shape == (3, 1, 8, 8)
+    assert torch.isfinite(images).all()
