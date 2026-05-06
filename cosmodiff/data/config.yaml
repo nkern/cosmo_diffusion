@@ -86,6 +86,11 @@ train:
   gradient_accumulation_steps: 1
   dataloader_num_workers: 4
   max_grad_norm: 1.0
+  conditioning: discrete       # 'discrete' (class_labels) or 'continuous' (encoder_hidden_states)
+  cfg_dropout: 0.0             # fraction of labels dropped for CFG training (0 disables)
+  guidance_scale: null         # CFG guidance scale at inference; null disables amplification
+  ema_sigma_rels: null         # e.g. [0.05, 0.28] to enable post-hoc EMA tracking
+  ema_update_every: 100        # optimizer steps between EMA updates
   verbose: true
   force_cpu: false
   pin_memory: false
