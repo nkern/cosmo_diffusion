@@ -252,20 +252,29 @@ def train(
                 # --- predict noise --------------------------------------
                 with accelerator.autocast():
                     if labels is not None:
-                        noise_pred = model(
+                        pred = model(
                             noisy_images,
                             timestep=timesteps,
                             class_labels=labels,
                             return_dict=False,
                         )[0]
                     else:
-                        noise_pred = model(
+                        pred = model(
                             noisy_images,
                             timesteps,
                             return_dict=False,
                         )[0]
 
-                    loss = F.mse_loss(noise_pred, noise)
+                    prediction_type = noise_scheduler.config.prediction_type
+                    if prediction_type == 'epsilon':
+                        target = noise
+                    elif prediction_type == 'v_prediction':
+                        target = noise_scheduler.get_velocity(images, noise, timesteps)
+                    elif prediction_type == 'sample':
+                        target = images
+                    else:
+                        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+                    loss = F.mse_loss(pred, target)
 
                 # --- backward -------------------------------------------
                 accelerator.backward(loss)
@@ -412,16 +421,16 @@ def generate(
         timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
 
         if labels is not None:
-            noise_pred = model(
+            pred = model(
                 images,
                 timestep=timesteps,
                 class_labels=labels,
                 return_dict=False,
             )[0]
         else:
-            noise_pred = model(images, timesteps, return_dict=False)[0]
+            pred = model(images, timesteps, return_dict=False)[0]
 
-        images = noise_scheduler.step(noise_pred, t, images, generator=generator).prev_sample
+        images = noise_scheduler.step(pred, t, images, generator=generator).prev_sample
 
     if renorm is not None:
         images = renorm(images)
