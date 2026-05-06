@@ -50,10 +50,6 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.setuptools]
 script-files = ["scripts/cosmodiff_train.py"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-namespaces = true
-
 [tool.setuptools.package-data]
 "cosmodiff.data" = ["*.npy", "*.yaml"]
 
