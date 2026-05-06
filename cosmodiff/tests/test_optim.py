@@ -587,3 +587,72 @@ def test_train_ema_multi_checkpoint_synthesis():
         params_hi = torch.cat([p.flatten() for p in synth_hi.parameters()])
         assert not torch.equal(params_lo, params_hi), \
             "sigma_rel=0.05 and sigma_rel=0.28 produced identical model weights"
+
+
+def test_train_script():
+    """cosmodiff_train.py main() runs end-to-end and writes a metrics file."""
+    import sys
+    import yaml
+    from scripts.cosmodiff_train import main
+
+    minimal_config = {
+        "global": {"device": "cpu", "dtype": "float32"},
+        "io": {"output_dir": None},  # filled in below
+        "data": {
+            "img_path": str(SIM_PATH),
+            "img_read_fn": "npy_read_fn",
+            "two_dim": True,
+            "zthin": 4,
+            "n_samples": 8,
+            "keep_on_cpu": True,
+            "log": False,
+            "normalization": "center-max",
+            "norm_kwargs": {"center": None, "xmax": None, "alpha": None, "beta": None},
+        },
+        "augmentations": {},
+        "model": {
+            "class": "UNet2DModel",
+            "kwargs": {
+                "sample_size": 8,
+                "in_channels": 1,
+                "out_channels": 1,
+                "layers_per_block": 1,
+                "block_out_channels": [16, 16],
+                "down_block_types": ["DownBlock2D", "DownBlock2D"],
+                "up_block_types": ["UpBlock2D", "UpBlock2D"],
+                "norm_num_groups": 8,
+            },
+        },
+        "noise_scheduler": {
+            "class": "DDPMScheduler",
+            "kwargs": {"num_train_timesteps": 10},
+        },
+        "optimizer": {"class": "AdamW", "kwargs": {"lr": 1e-4}},
+        "lr_scheduler": {"class": "ConstantLR", "kwargs": {"factor": 1.0, "total_iters": 0}},
+        "train": {
+            "num_epochs": 2,
+            "batch_size": 4,
+            "mixed_precision": "no",
+            "checkpoint_every_n_epochs": 2,
+            "force_cpu": True,
+            "verbose": False,
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        minimal_config["io"]["output_dir"] = tmp_dir
+        config_path = os.path.join(tmp_dir, "config.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(minimal_config, f)
+
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["cosmodiff_train.py", "--config", config_path]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        metrics_files = [
+            f for f in os.listdir(tmp_dir) if f.startswith("metrics_epoch_")
+        ]
+        assert len(metrics_files) == 1, f"expected 1 metrics file, got {metrics_files}"
