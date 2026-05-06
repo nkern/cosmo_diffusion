@@ -106,7 +106,7 @@ def main():
     metrics_path = os.path.join(
         output_dir, "metrics_epoch_{:04d}.json".format(len(result['metrics']["epoch_loss"]) - 1)
     )
-    write_metrics(metrics, metrics_path)
+    write_metrics(result['metrics'], metrics_path)
     print(f"Metrics written to {metrics_path}")
 
 if __name__ == "__main__":
