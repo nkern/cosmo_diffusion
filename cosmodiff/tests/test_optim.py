@@ -714,3 +714,85 @@ def test_train_script():
             f for f in os.listdir(tmp_dir) if f.startswith("metrics_epoch_")
         ]
         assert len(metrics_files) == 1, f"expected 1 metrics file, got {metrics_files}"
+
+
+def test_sample_script():
+    """cosmodiff_sample.py main() runs end-to-end and writes an .npy file."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    # First train a tiny model so we have a real checkpoint on disk.
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "4",
+                "--batch_size", "2",
+                "--image_shape", "1", "8", "8",
+                "--ddim_thinning", "2",  # 5 inference steps for speed
+                "--device", "cpu",
+                "--output", out_npy,
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy), f"expected samples at {out_npy}"
+        arr = np.load(out_npy)
+        assert arr.shape == (4, 1, 8, 8), f"unexpected shape {arr.shape}"
+        assert np.isfinite(arr).all(), "non-finite values in generated samples"
+
+
+def test_sample_script_with_ema():
+    """cosmodiff_sample.py with --ema_sigma_rel synthesizes EMA before sampling."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples_ema.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "2",
+                "--image_shape", "1", "8", "8",
+                "--ddim_thinning", "5",
+                "--device", "cpu",
+                "--output", out_npy,
+                "--ema_sigma_rel", "0.05",
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy)
+        arr = np.load(out_npy)
+        assert arr.shape == (2, 1, 8, 8)
+        assert np.isfinite(arr).all()
