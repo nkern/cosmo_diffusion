@@ -48,6 +48,7 @@ def train(
     ema_sigma_rels: Optional[tuple] = None,
     ema_update_every: int = 1,
     min_snr_gamma: Optional[float] = None,
+    sigma_log_normal: Optional[tuple] = None,
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -139,6 +140,13 @@ def train(
             sample-prediction), which balances training signal across
             timesteps and is especially helpful for v-prediction.  ``None``
             (default) disables Min-SNR (uniform MSE).
+        sigma_log_normal (tuple of float, optional): If set to a
+            ``(P_mean, P_std)`` tuple, samples log-σ from ``Normal(P_mean,
+            P_std)`` each step (Karras et al. EDM 2022) instead of uniform
+            timestep sampling.  Sampled log-σ is mapped to the nearest
+            discrete timestep of the underlying scheduler via
+            ``torch.searchsorted``.  EDM defaults are ``(-1.2, 1.2)``.
+            ``None`` (default) keeps standard uniform timestep sampling.
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -266,6 +274,13 @@ def train(
     if cfg_dropout > 0.0 and conditioning == 'discrete':
         cfg_null_token = accelerator.unwrap_model(model).config.num_class_embeds - 1
 
+    # precompute log-σ schedule for EDM-style log-normal sigma sampling
+    log_sigma_schedule = None
+    if sigma_log_normal is not None:
+        alphas_cumprod = noise_scheduler.alphas_cumprod.clamp(min=1e-10)
+        log_sigma_schedule = 0.5 * torch.log((1.0 - alphas_cumprod) / alphas_cumprod)
+        # monotonically increasing in t; we'll map sampled log-σ to nearest t via searchsorted
+
     # ------------------------------------------------------------------ #
     # 5.  Training loop                                                    #
     # ------------------------------------------------------------------ #
@@ -307,12 +322,21 @@ def train(
             with accelerator.accumulate(model):
                 # --- forward diffusion ----------------------------------
                 noise = torch.randn_like(images)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (images.shape[0],),
-                    device=images.device,
-                ).long()
+                if sigma_log_normal is not None:
+                    # EDM-style log-normal sigma sampling: log σ ~ N(P_mean, P_std)
+                    P_mean, P_std = sigma_log_normal
+                    log_sigma = P_mean + P_std * torch.randn(images.shape[0], device=images.device)
+                    sched = log_sigma_schedule.to(images.device)
+                    log_sigma = torch.clamp(log_sigma, sched.min().item(), sched.max().item())
+                    timesteps = torch.searchsorted(sched, log_sigma)
+                    timesteps = torch.clamp(timesteps, 0, noise_scheduler.config.num_train_timesteps - 1).long()
+                else:
+                    timesteps = torch.randint(
+                        0,
+                        noise_scheduler.config.num_train_timesteps,
+                        (images.shape[0],),
+                        device=images.device,
+                    ).long()
                 noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
 
                 # --- predict noise --------------------------------------

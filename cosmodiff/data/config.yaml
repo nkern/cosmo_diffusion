@@ -92,6 +92,7 @@ train:
   ema_sigma_rels: null         # e.g. [0.03, 0.15] to enable post-hoc EMA tracking
   ema_update_every: 1          # optimizer steps between EMA updates (Karras assumes per-step)
   min_snr_gamma: null          # set to e.g. 5.0 to enable Min-SNR loss weighting (Hang et al. 2023)
+  sigma_log_normal: null       # set to e.g. [-1.2, 1.2] for EDM-style log-σ ~ Normal(P_mean, P_std) sampling
   verbose: true
   force_cpu: false
   pin_memory: false
