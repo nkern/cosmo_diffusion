@@ -91,6 +91,7 @@ train:
   cfg_dropout: 0.0             # fraction of labels dropped for CFG training (0 disables)
   ema_sigma_rels: null         # e.g. [0.03, 0.15] to enable post-hoc EMA tracking
   ema_update_every: 1          # optimizer steps between EMA updates (Karras assumes per-step)
+  min_snr_gamma: null          # set to e.g. 5.0 to enable Min-SNR loss weighting (Hang et al. 2023)
   verbose: true
   force_cpu: false
   pin_memory: false

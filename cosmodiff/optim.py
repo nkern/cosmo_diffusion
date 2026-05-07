@@ -47,6 +47,7 @@ def train(
     conditioning: str = 'discrete',
     ema_sigma_rels: Optional[tuple] = None,
     ema_update_every: int = 1,
+    min_snr_gamma: Optional[float] = None,
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -130,6 +131,14 @@ def train(
             profile because the time-varying beta formula assumes per-step
             updates — only increase if profiling shows the EMA lerp is a
             meaningful fraction of step time.
+        min_snr_gamma (float, optional): If set, applies Min-SNR loss
+            weighting from Hang et al. 2023.  Recommended value is ``5.0``.
+            The per-sample loss is multiplied by ``min(SNR(t), gamma)``
+            divided by a parameterization-dependent factor (``SNR(t)`` for
+            epsilon-prediction, ``SNR(t)+1`` for v-prediction, ``1`` for
+            sample-prediction), which balances training signal across
+            timesteps and is especially helpful for v-prediction.  ``None``
+            (default) disables Min-SNR (uniform MSE).
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -329,7 +338,24 @@ def train(
                         target = images
                     else:
                         raise ValueError(f"Unsupported prediction_type: {prediction_type}")
-                    loss = F.mse_loss(pred, target)
+
+                    if min_snr_gamma is None:
+                        loss = F.mse_loss(pred, target)
+                    else:
+                        # Min-SNR loss weighting (Hang et al. 2023). SNR = α_bar / (1 - α_bar).
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+                        snr = alphas_cumprod[timesteps] / (1.0 - alphas_cumprod[timesteps])
+                        clipped_snr = torch.clamp(snr, max=min_snr_gamma)
+                        if prediction_type == 'epsilon':
+                            weight = clipped_snr / snr
+                        elif prediction_type == 'sample':
+                            weight = clipped_snr
+                        else:  # v_prediction
+                            weight = clipped_snr / (snr + 1.0)
+                        per_sample_mse = F.mse_loss(pred, target, reduction='none').mean(
+                            dim=list(range(1, pred.ndim))
+                        )
+                        loss = (weight * per_sample_mse).mean()
 
                 # --- backward -------------------------------------------
                 accelerator.backward(loss)

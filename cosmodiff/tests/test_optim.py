@@ -615,6 +615,23 @@ def test_load_ema_snapshot():
         assert all(torch.isfinite(p).all() for p in m0.parameters())
 
 
+def test_train_min_snr_weighting():
+    """train() with min_snr_gamma set runs and produces finite losses for all 3 prediction types."""
+    for prediction_type in ('epsilon', 'v_prediction', 'sample'):
+        model = _make_unet()
+        dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = train(
+                dataset, model,
+                noise_scheduler=DDPMScheduler(num_train_timesteps=10, prediction_type=prediction_type),
+                num_epochs=2, batch_size=4,
+                mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+                min_snr_gamma=5.0,
+            )
+            assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss']), \
+                f"non-finite loss with min_snr_gamma + prediction_type={prediction_type}"
+
+
 def test_train_script():
     """cosmodiff_train.py main() runs end-to-end and writes a metrics file."""
     import sys
