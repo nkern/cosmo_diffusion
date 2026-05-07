@@ -615,6 +615,54 @@ def test_load_ema_snapshot():
         assert all(torch.isfinite(p).all() for p in m0.parameters())
 
 
+def test_train_ema_burn_in():
+    """EMA burn-in delays update() until global_step >= ema_burn_in.
+
+    With burn_in larger than total steps, no EMA updates fire and no .pt files
+    should be written. With burn_in less than total steps, snapshots exist and
+    their internal step counter equals total_steps - burn_in.
+    """
+    import glob
+
+    # case 1: burn_in exceeds total training steps → no snapshots
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 2 epochs × 2 batches/epoch = 4 total steps, burn_in=10 skips them all
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+            ema_burn_in=10,
+        )
+        pt_files = glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*/ema/*.pt'))
+        assert len(pt_files) == 0, f"expected no EMA snapshots when burn_in>total, got {pt_files}"
+
+    # case 2: burn_in skips a few steps; snapshots present and stamped with t_eff
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 4 epochs × 2 batches/epoch = 8 total steps, burn_in=3 → 5 EMA updates
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+            ema_burn_in=3,
+        )
+        pt_files = sorted(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*/ema/*.pt')))
+        assert len(pt_files) == 2, f"expected 2 EMA snapshots, got {pt_files}"
+        # filename format: {profile_index}.{ema_internal_step}.pt
+        # ema_internal_step at the final checkpoint should be total_steps - burn_in = 8 - 3 = 5
+        for f in pt_files:
+            stem = os.path.basename(f).replace('.pt', '')
+            _, step_str = stem.split('.')
+            assert int(step_str) == 5, f"expected internal step 5, got {step_str} from {f}"
+
+
 def test_train_sigma_log_normal_sampling():
     """train() with sigma_log_normal samples timesteps and produces finite losses."""
     model = _make_unet()

@@ -47,6 +47,7 @@ def train(
     conditioning: str = 'discrete',
     ema_sigma_rels: Optional[tuple] = None,
     ema_update_every: int = 1,
+    ema_burn_in: int = 0,
     min_snr_gamma: Optional[float] = None,
     sigma_log_normal: Optional[tuple] = None,
     verbose: bool = True,
@@ -132,6 +133,13 @@ def train(
             profile because the time-varying beta formula assumes per-step
             updates — only increase if profiling shows the EMA lerp is a
             meaningful fraction of step time.
+        ema_burn_in (int): Number of initial optimizer steps during which the
+            EMA is *not* updated.  Defaults to ``0`` (start tracking from step
+            0).  When set, the EMA's internal time origin shifts to step
+            ``ema_burn_in``, so ``sigma_rel`` is interpreted as a fraction of
+            the post-burn-in trajectory ``[ema_burn_in, T_total]``.  Useful to
+            avoid contaminating the EMA with the very-early random/unstable
+            weights, particularly for wider EMA profiles.
         min_snr_gamma (float, optional): If set, applies Min-SNR loss
             weighting from Hang et al. 2023.  Recommended value is ``5.0``.
             The per-sample loss is multiplied by ``min(SNR(t), gamma)``
@@ -389,7 +397,7 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if ema is not None:
+            if ema is not None and global_step >= ema_burn_in:
                 ema.update()
 
             lr_scheduler.step()
@@ -445,6 +453,7 @@ def train(
                         "kwargs": utils._get_lr_scheduler_kwargs(raw_sched),
                     },
                     "ema_sigma_rels": list(ema_sigma_rels) if ema_sigma_rels is not None else None,
+                    "ema_burn_in": ema_burn_in,
                 }
                 with open(os.path.join(ckpt_save_path, "checkpoint_config.yaml"), "w") as f:
                     yaml.dump(_to_yaml_safe(ckpt_cfg), f)
@@ -452,7 +461,7 @@ def train(
                 # Model weights (via hook) + optimizer moments + grad scaler + RNG
                 accelerator.save_state(ckpt_save_path)
 
-                if ema is not None:
+                if ema is not None and ema.step.item() > 0:
                     from pathlib import Path
                     ema.checkpoint_folder = Path(ckpt_save_path) / 'ema'
                     ema.checkpoint_folder.mkdir(exist_ok=True)
