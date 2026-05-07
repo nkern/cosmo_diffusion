@@ -61,6 +61,7 @@ noise_scheduler:
   class: DDPMScheduler
   kwargs:
     num_train_timesteps: 1000
+    rescale_betas_zero_snr: true
 
 # --- optimizer ---
 optimizer:
@@ -88,8 +89,8 @@ train:
   max_grad_norm: 1.0
   conditioning: discrete       # 'discrete' (class_labels) or 'continuous' (encoder_hidden_states)
   cfg_dropout: 0.0             # fraction of labels dropped for CFG training (0 disables)
-  ema_sigma_rels: null         # e.g. [0.05, 0.28] to enable post-hoc EMA tracking
-  ema_update_every: 100        # optimizer steps between EMA updates
+  ema_sigma_rels: null         # e.g. [0.03, 0.15] to enable post-hoc EMA tracking
+  ema_update_every: 1          # optimizer steps between EMA updates (Karras assumes per-step)
   verbose: true
   force_cpu: false
   pin_memory: false

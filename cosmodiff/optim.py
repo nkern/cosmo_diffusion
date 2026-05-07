@@ -46,7 +46,7 @@ def train(
     cfg_dropout: float = 0.0,
     conditioning: str = 'discrete',
     ema_sigma_rels: Optional[tuple] = None,
-    ema_update_every: int = 100,
+    ema_update_every: int = 1,
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -115,16 +115,21 @@ def train(
             automatically unsqueezed to ``(B, 1, D)``.
         ema_sigma_rels (tuple of float, optional): If set, enables post-hoc
             EMA tracking via ``ema-pytorch``.  Two values are required (e.g.
-            ``(0.05, 0.28)``); they control the two power-function EMA
-            profiles checkpointed at each epoch.  After training,
+            ``(0.03, 0.15)``); they control the two power-function EMA
+            profiles checkpointed at each epoch.  Choose them to bracket the
+            target ``sigma_rel`` range you want to synthesize, with the lower
+            value anchoring your floor and the upper value giving some
+            headroom above your ceiling.  After training,
             ``ema.synthesize_ema_model(sigma_rel=...)`` reconstructs any
             target profile from those snapshots.  ``None`` (default) disables
             EMA entirely.
         ema_update_every (int): How often (in optimizer steps) to update the
-            EMA profiles.  Defaults to ``100``, matching the ``ema-pytorch``
-            default and suitable for large models where per-step EMA is
-            expensive.  Set to ``1`` for small models or short training runs
-            to ensure the EMA is updated at every step.
+            EMA profiles.  Defaults to ``1`` (every step), matching the Karras
+            et al. 2024 reference implementation and the broader diffusion
+            training literature.  Larger values silently distort the EMA
+            profile because the time-varying beta formula assumes per-step
+            updates — only increase if profiling shows the EMA lerp is a
+            meaningful fraction of step time.
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -669,6 +674,54 @@ def synthesize_ema_from_checkpoints(
             checkpoint_every_num_steps='manual',
         )
         return ema.synthesize_ema_model(sigma_rel=sigma_rel_target)
+
+
+def load_ema_snapshot(
+    model: torch.nn.Module,
+    checkpoint_dir: str,
+    profile_index: int = 0,
+) -> torch.nn.Module:
+    """Load a single raw EMA snapshot into ``model`` in-place.
+
+    Reads the ``.pt`` snapshot file for the given training profile from
+    ``<checkpoint_dir>/ema/`` and copies its weights into ``model`` (no
+    synthesis, no pooling across checkpoints).
+
+    Use this when you want exactly the EMA at one of the trained ``sigma_rels``
+    captured at one specific epoch.  For arbitrary target ``sigma_rel`` values
+    or for pooling across many checkpoints, use
+    :func:`synthesize_ema_from_checkpoints` instead.
+
+    Args:
+        model: the nn.Module to load weights into; modified in place and returned.
+        checkpoint_dir: a ``checkpoint-epoch-XXXX`` directory containing an
+            ``ema/`` subdirectory.
+        profile_index: which trained profile to load — ``0`` for
+            ``sigma_rels[0]`` (e.g. 0.05), ``1`` for ``sigma_rels[1]``
+            (e.g. 0.28).  Defaults to ``0``.
+
+    Returns:
+        The same ``model``, with EMA weights loaded.
+    """
+    from pathlib import Path
+
+    ema_dir = Path(checkpoint_dir) / 'ema'
+    pt_files = sorted(ema_dir.glob(f'{profile_index}.*.pt'))
+    if not pt_files:
+        raise ValueError(
+            f"No EMA snapshots for profile {profile_index} in {ema_dir}"
+        )
+    # filename format is {profile_index}.{global_step}.pt — pick the latest step
+    pt_file = max(pt_files, key=lambda p: int(p.stem.split('.')[1]))
+
+    snap = torch.load(pt_file, map_location='cpu', weights_only=False)
+    ema_state = {
+        k[len('ema_model.'):]: v
+        for k, v in snap.items()
+        if k.startswith('ema_model.')
+    }
+    model.load_state_dict(ema_state)
+    return model
 
 
 class PCAEncoder(torch.nn.Module):

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel, PixArtTransformer2DModel
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
-from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder, synthesize_ema_from_checkpoints, compute_ema_profiles
+from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder, synthesize_ema_from_checkpoints, compute_ema_profiles, load_ema_snapshot
 from cosmodiff.augment import RandomRoll, RandomFlip
 from cosmodiff.data import DATA_PATH
 
@@ -518,7 +518,6 @@ def test_train_ema():
             force_cpu=True,
             verbose=False,
             ema_sigma_rels=(0.05, 0.28),
-            ema_update_every=1,
         )
 
         assert result['ema'] is not None
@@ -563,7 +562,6 @@ def test_train_ema_multi_checkpoint_synthesis():
             force_cpu=True,
             verbose=False,
             ema_sigma_rels=sigma_rels_train,
-            ema_update_every=1,
         )
 
         assert len(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*'))) == 3
@@ -587,6 +585,34 @@ def test_train_ema_multi_checkpoint_synthesis():
         params_hi = torch.cat([p.flatten() for p in synth_hi.parameters()])
         assert not torch.equal(params_lo, params_hi), \
             "sigma_rel=0.05 and sigma_rel=0.28 produced identical model weights"
+
+
+def test_load_ema_snapshot():
+    """load_ema_snapshot loads raw profile weights from a single checkpoint."""
+    import glob
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+        )
+
+        ckpt_dirs = sorted(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*')))
+        assert len(ckpt_dirs) == 2
+        latest_ckpt = ckpt_dirs[-1]
+
+        # different profiles should produce different weights
+        m0 = load_ema_snapshot(_make_unet(), latest_ckpt, profile_index=0)
+        m1 = load_ema_snapshot(_make_unet(), latest_ckpt, profile_index=1)
+        p0 = torch.cat([p.flatten() for p in m0.parameters()])
+        p1 = torch.cat([p.flatten() for p in m1.parameters()])
+        assert not torch.equal(p0, p1), "profile 0 and 1 snapshots are identical"
+        assert all(torch.isfinite(p).all() for p in m0.parameters())
 
 
 def test_train_script():
