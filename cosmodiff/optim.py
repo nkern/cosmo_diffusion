@@ -334,7 +334,7 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if ema is not None and accelerator.sync_gradients:
+            if ema is not None:
                 ema.update()
 
             lr_scheduler.step()
