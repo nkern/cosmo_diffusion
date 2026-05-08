@@ -75,7 +75,8 @@ def main():
 
     # --- check for existing checkpoint ----------------------------------
     latest_ckpt = find_latest_checkpoint(output_dir)
-    dataset, norm = parse_config_data(config)
+    data_out = parse_config_data(config)
+    dataset = data_out["data"]
 
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
@@ -88,13 +89,13 @@ def main():
 
     else:
         print("No checkpoint found, training from scratch.")
-        model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
+        model_out = parse_config_model(config)
         result = train(
             dataset,
-            model,
-            optimizer=optimizer,
-            noise_scheduler=noise_scheduler,
-            lr_scheduler=lr_scheduler,
+            model_out["model"],
+            optimizer=model_out["optimizer"],
+            noise_scheduler=model_out["noise_scheduler"],
+            lr_scheduler=model_out["lr_scheduler"],
             output_dir=output_dir,
             **config["train"],
         )

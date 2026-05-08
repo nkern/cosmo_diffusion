@@ -6,10 +6,6 @@ import torch
 from cosmodiff.utils import (
     ArrayDataset,
     load_data,
-    minmax_norm,
-    center_max_norm,
-    tanh_norm,
-    Normalization,
     npy_read_fn,
     parse_config_model,
     parse_config_data,
@@ -17,6 +13,7 @@ from cosmodiff.utils import (
     write_metrics,
     read_metrics,
 )
+from cosmodiff.transform import Normalization
 from cosmodiff.data import DATA_PATH
 
 CONFIG_PATH = DATA_PATH / 'config.yaml'
@@ -34,10 +31,10 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
-    images_all, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)
+    images_all = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)['images']
     assert images_all.shape[0] == DATA_N
 
-    images_sub, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)
+    images_sub = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)['images']
     assert images_sub.shape[0] == 3
 
     for i in range(len(images_sub)):
@@ -51,12 +48,13 @@ def test_n_samples_labels_in_sync():
     # labels encode each sample's original row index so we can verify alignment
     labels = np.arange(20)
 
-    images, out_labels, _ = load_data(
+    out = load_data(
         arr, img_read_fn=None,
         label_path=labels, label_read_fn=None,
         n_samples=7, seed=0,
         normalization=None, two_dim=False,
     )
+    images, out_labels = out['images'], out['labels']
     assert images.shape[0] == 7
     assert out_labels.shape[0] == 7
 
@@ -67,17 +65,17 @@ def test_n_samples_labels_in_sync():
 
 
 def test_seed():
-    imgs1, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
-    imgs2, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)
-    imgs3, _, _ = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)
+    imgs1 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)['images']
+    imgs2 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)['images']
+    imgs3 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)['images']
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
 
 def test_memmap():
     mmap = np.load(SIM_PATH, mmap_mode="r")
-    images_all, _, _ = load_data(mmap, img_read_fn=None, normalization=None, two_dim=False)
-    images_sub, _, _ = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, two_dim=False)
+    images_all = load_data(mmap, img_read_fn=None, normalization=None, two_dim=False)['images']
+    images_sub = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, two_dim=False)['images']
     assert images_all.shape[0] == DATA_N
     assert images_sub.shape[0] == 3
 
@@ -98,165 +96,6 @@ def test_array_dataset():
     item = ds_labeled[3]
     assert item["labels"] == 3
     assert torch.allclose(item["images"], images[3])
-
-
-# ---------------------------------------------------------------------------
-# minmax_norm / center_max_norm / tanh_norm
-# ---------------------------------------------------------------------------
-
-def test_minmax_norm():
-    # use non-negative data so the formula x *= 2/xmax is well-defined
-    x = torch.rand(4, 8, 8)
-    out, params = minmax_norm(x)
-    assert out.min().item() >= -1.0 - 1e-6
-    assert out.max().item() <= 1.0 + 1e-6
-    assert 'xmin' in params and 'xmax' in params
-
-
-def test_minmax_norm_inverse():
-    x = torch.rand(4, 8, 8)
-    out, params = minmax_norm(x)
-    recovered, _ = minmax_norm(out, inverse=True, **params)
-    assert torch.allclose(recovered, x, atol=1e-5)
-
-
-def test_minmax_norm_inplace():
-    x = torch.rand(4, 8, 8)
-    x_clone = x.clone()
-    out, _ = minmax_norm(x, inplace=True)
-    assert out.data_ptr() == x.data_ptr()
-    _, params2 = minmax_norm(x_clone)
-    assert torch.allclose(out, x_clone.sub(params2['xmin']).mul(2 / params2['xmax']).sub(1), atol=1e-5)
-
-
-def test_center_max_norm():
-    x = torch.randn(100)
-    out, params = center_max_norm(x.clone())
-    assert abs(out.mean().item()) < 0.1
-    assert out.abs().max().item() <= 1.0 + 1e-6
-    assert 'center' in params and 'xmax' in params
-
-
-def test_center_max_norm_inverse():
-    x = torch.randn(100)
-    out, params = center_max_norm(x.clone())
-    recovered, _ = center_max_norm(out, inverse=True, **params)
-    assert torch.allclose(recovered, x, atol=1e-5)
-
-
-def test_tanh_norm():
-    x = torch.randn(100)
-    out, params = tanh_norm(x)
-    assert out.shape == x.shape
-    assert set(params.keys()) == {'mu', 'alpha', 'beta', 'delta', 'gamma', 'sigma'}
-    # tanh output is strictly bounded by sigma * (-beta, alpha)
-    assert out.min().item() > -params['beta'] * params['sigma']
-    assert out.max().item() < params['alpha'] * params['sigma']
-
-
-def test_tanh_norm_sigma():
-    x = torch.randn(100)
-    out_default, _ = tanh_norm(x, sigma=1.0)
-    out_scaled, params = tanh_norm(x, sigma=2.0)
-    assert torch.allclose(out_scaled, out_default * 2.0, atol=1e-6)
-    assert params['sigma'] == 2.0
-
-
-def test_tanh_norm_inverse():
-    x = torch.randn(100) * 0.5  # keep within tanh saturation limits
-    out, params = tanh_norm(x)
-    recovered, _ = tanh_norm(out, inverse=True, **params)
-    assert torch.allclose(recovered, x, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Normalization class
-# ---------------------------------------------------------------------------
-
-def test_normalization_minmax():
-    x = torch.rand(10, 1, 8, 8)
-    norm = Normalization('min-max', inplace=False)
-    out = norm(x)
-    assert out is not None
-    assert out.shape == x.shape
-    assert out.min().item() >= -1.0 - 1e-6
-    assert out.max().item() <= 1.0 + 1e-6
-
-
-def test_normalization_centermax():
-    x = torch.randn(10, 1, 8, 8)
-    norm = Normalization('center-max', inplace=False)
-    out = norm(x)
-    assert out is not None
-    assert out.shape == x.shape
-    assert out.abs().max().item() <= 1.0 + 1e-6
-
-
-def test_normalization_inverse():
-    x = torch.rand(10, 1, 8, 8)
-    norm = Normalization('min-max', inplace=False)
-    out = norm(x)
-    recovered = norm.inverse(out)
-    assert torch.allclose(recovered, x, atol=1e-5)
-
-
-def test_normalization_tanh():
-    # tanh branch: minmax first, then tanh — output is strictly within sigma*(-beta, alpha)
-    x = torch.rand(10, 1, 8, 8)
-    norm = Normalization('tanh', inplace=False)
-    out = norm(x)
-    assert out.shape == x.shape
-    assert out.min().item() > -norm.kwargs['beta'] * norm.kwargs['sigma']
-    assert out.max().item() < norm.kwargs['alpha'] * norm.kwargs['sigma']
-    # params from both stages must be stored after forward
-    assert all(k in norm.kwargs for k in ('center', 'xmax', 'mu', 'alpha', 'beta', 'gamma', 'delta', 'sigma'))
-
-
-def test_normalization_tanh_inverse():
-    x = torch.rand(10, 1, 8, 8)
-    norm = Normalization('tanh', inplace=False)
-    out = norm(x)
-    recovered = norm.inverse(out)
-    assert torch.allclose(recovered, x, atol=1e-5)
-
-
-def test_normalization_params_fixed_when_given():
-    """Params supplied at init must not be overwritten by the forward pass."""
-    fixed_xmin = torch.tensor(0.0)
-    fixed_xmax = torch.tensor(2.0)
-    norm = Normalization('min-max', inplace=False, xmin=fixed_xmin, xmax=fixed_xmax)
-
-    # forward on data whose natural min/max differ from the fixed values
-    x = torch.rand(10, 1, 8, 8) * 10 + 5
-    norm(x)
-
-    assert torch.equal(norm.kwargs['xmin'], fixed_xmin), "xmin was overwritten"
-    assert torch.equal(norm.kwargs['xmax'], fixed_xmax), "xmax was overwritten"
-
-
-def test_normalization_params_inferred_on_first_forward():
-    """Params not supplied at init must be populated after the first forward pass."""
-    import copy
-    norm = Normalization('min-max', inplace=False)
-    assert 'xmin' not in norm.kwargs
-    assert 'xmax' not in norm.kwargs
-
-    x = torch.rand(10, 1, 8, 8)
-    norm(x)
-
-    assert 'xmin' in norm.kwargs, "xmin not set after first forward"
-    assert 'xmax' in norm.kwargs, "xmax not set after first forward"
-    assert np.allclose(norm.kwargs['xmin'], x.min().item())
-    assert np.allclose(norm.kwargs['xmax'], x.max().item())
-
-    # second forward on different data must reuse the inferred params, not recompute
-    y = torch.rand(10, 1, 8, 8) * 10 + 5
-    xmin_after_first = copy.copy(norm.kwargs['xmin'])
-    xmax_after_first = copy.copy(norm.kwargs['xmax'])
-    norm(y)
-
-    assert np.allclose(norm.kwargs['xmin'], xmin_after_first), "xmin changed on second forward"
-    assert np.allclose(norm.kwargs['xmax'], xmax_after_first), "xmax changed on second forward"
 
 
 # ---------------------------------------------------------------------------
@@ -305,11 +144,11 @@ def test_parse_config_model():
         "noise_scheduler": {"class": "DDPMScheduler", "kwargs": {"num_train_timesteps": 10}},
         "lr_scheduler": {"class": "ConstantLR", "kwargs": {"factor": 1.0, "total_iters": 0}},
     }
-    model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
-    assert model is not None
-    assert optimizer is not None
-    assert noise_scheduler is not None
-    assert lr_scheduler is not None
+    out = parse_config_model(config)
+    assert out['model'] is not None
+    assert out['optimizer'] is not None
+    assert out['noise_scheduler'] is not None
+    assert out['lr_scheduler'] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +173,8 @@ def test_parse_config_data():
             "keep_on_cpu": True,
         },
     }
-    dataset, norm = parse_config_data(config)
+    out = parse_config_data(config)
+    dataset = out['data']
     assert len(dataset) == 6 * 4  # Nbatch * Nz slices
     item = dataset[0]
     assert "images" in item
@@ -350,7 +190,11 @@ def test_config_yaml_parse_model():
     config = read_config(CONFIG_PATH)
     config['global']['device'] = 'cpu'  # don't require GPU in CI
 
-    model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
+    out = parse_config_model(config)
+    model = out['model']
+    optimizer = out['optimizer']
+    noise_scheduler = out['noise_scheduler']
+    lr_scheduler = out['lr_scheduler']
 
     assert type(model).__name__ == 'UNet2DModel'
     assert model.config.sample_size == 64
@@ -379,8 +223,11 @@ def test_config_yaml_parse_data():
     cfg['data']['img_path'] = str(SIM_PATH)
     cfg['data']['label_path'] = None
     cfg['data']['keep_on_cpu'] = True
+    cfg['data']['transform'] = None  # this test checks raw shape, not transform behavior
 
-    dataset, norm = parse_config_data(cfg)
+    out = parse_config_data(cfg)
+    dataset = out['data']
+    norm = out['norm']
 
     zthin = config['data']['zthin']
     assert isinstance(dataset, ArrayDataset)

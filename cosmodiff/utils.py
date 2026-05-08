@@ -16,6 +16,8 @@ import time
 import yaml
 from typing import Optional
 
+from .transform import Normalization
+
 
 class ArrayDataset(Dataset):
     """Tensor dataset with optional augmentation and class labels, applied at
@@ -76,6 +78,7 @@ def load_data(
     log: bool = False,
     normalization: str | None = None,
     norm_kwargs: dict | None = None,
+    transform: list[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -120,11 +123,19 @@ def load_data(
         normalization (str): Normalize image pixel distribution.
             ['min-max', 'center-max']
         norm_kwargs: kwargs for pixel normalization function
+        transform (list): list of data transforms e.g. ['log', 'rfft2'].
+            Note that 'log' always happens first if included.
 
     Returns:
-        tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` on
-        ``device``, and ``labels`` is a LongTensor of shape ``(N,)`` or
-        ``None`` if ``label_path`` was not provided.
+        dict: A dictionary with keys
+
+            * ``'images'`` — ``torch.Tensor`` on ``device``.
+            * ``'labels'`` — ``LongTensor`` of shape ``(N,)``, or ``None`` if
+              ``label_path`` was not provided.
+            * ``'norm'`` — fitted :class:`Normalization` instance, or ``None``
+              if ``normalization`` was not requested.
+            * ``'tform'`` — fitted :class:`Transform` instance, or ``None`` if
+              ``transform`` was not requested.
 
     Example::
 
@@ -133,7 +144,7 @@ def load_data(
         def read_images(path):
             return np.load(path)
 
-        images, labels = load_data(
+        out = load_data(
             img_path="images.npy",
             img_read_fn=read_images,
             device="cpu",
@@ -141,6 +152,7 @@ def load_data(
             two_dim=True,
             zthin=4,
         )
+        images, labels = out['images'], out['labels']
     """
     # --- images ---------------------------------------------------------
     if isinstance(img_path, np.ndarray):
@@ -180,15 +192,6 @@ def load_data(
 
         labels = torch.as_tensor(labels, dtype=torch.long)
 
-    # --- transforms -----------------------------------------------------
-    if log:
-        images = images.log()
-
-    norm = None
-    if normalization is not None:
-        norm = Normalization(normalization, inplace=False, **(norm_kwargs or {}))
-        images = norm(images)
-
     # --- reshape --------------------------------------------------------
     if two_dim:
         images = images[:, ::zthin]
@@ -196,7 +199,33 @@ def load_data(
     else:
         images = images.unsqueeze(1)
 
-    return images, labels, norm
+    # --- transforms -----------------------------------------------------
+    tform = None
+    if transform is not None:
+        from cosmodiff.transform import Transform
+        if 'log' in transform:
+            log = True
+            transform.remove('log')
+        else:
+            log = False
+        tform = Transform(transform, log=log)
+
+        images = tform(images)
+
+    norm = None
+    if normalization is not None:
+        norm = Normalization(normalization, inplace=False, **(norm_kwargs or {}))
+        images = norm(images)
+
+
+    output = {
+        'images': images,
+        'labels': labels,
+        'norm': norm,
+        'tform': tform,
+    }
+
+    return output
 
 
 def _import_class(qualified_name: str):
@@ -274,165 +303,6 @@ def load_checkpoint(ckpt_path: str):
     return model, noise_scheduler, optimizer, lr_scheduler, augmentations
 
 
-def minmax_norm(
-    x: torch.Tensor,
-    xmin: float | None = None,
-    xmax: float | None = None,
-    inverse: bool = False,
-    inplace: bool = False,
-    **kwargs
-) -> torch.Tensor:
-    """Normalize a tensor to ``[-1, 1]`` via min-max scaling.
-
-    Args:
-        x (torch.Tensor): Input tensor of any shape.
-        xmin (float): normalize by min, default is x.min()
-        xmax (float): normalize by max, default is x.max()
-        inverse (bool): if True, apply the inverse mapping (requires xmin, xmax)
-        inplace (bool): edit tensor inplace, default is False
-
-    Returns:
-        torch.Tensor: Normalized tensor with values in ``[-1, 1]``.
-        dict: normalization parameters
-    """
-    if not inplace:
-        x = x.clone()
-    if not inverse:
-        if xmin is None:
-            xmin = x.min().item()
-        if xmax is None:
-            xmax = x.max().item()
-        x -= xmin
-        x *= 2 / xmax
-        x -= 1
-
-    else:
-        assert xmin is not None
-        assert xmax is not None
-        x = (x + 1) / 2 * xmax + xmin
-
-    return x, {'xmin': xmin, 'xmax': xmax}
-
-
-def center_max_norm(
-    x: torch.Tensor,
-    center: float | None = None,
-    xmax: float | None = None,
-    inverse: bool | None = False,
-    inplace: bool = False,
-    **kwargs
-):
-    """Center a tensor based on its average, and normalize by its absolute deviation.
-
-    Args:
-        x (torch.Tensor): Input tensor of any shape.
-        center (float): average centering to subtract off
-        xmax (float): abs-max normalization to divide by
-        inverse (bool): apply inverse operation, requires center and xmax
-        inplace (bool): If True, edit inplace. 
-
-    Returns:
-        torch.Tensor: scaled tensor
-        dict: normalization parameters
-    """
-    if not inplace:
-        x = x.clone()
-
-    if not inverse:
-        # center
-        if center is None:
-            center = x.mean().item()
-        x -= center
-
-        # scale by max-abs
-        if xmax is None:
-            xmax = x.abs().max().item()
-        x /= xmax
-
-    else:
-        assert xmax is not None
-        assert center is not None
-        x *= xmax
-        x += center
-
-    return x, {'center': center, 'xmax': xmax}
-
-
-def tanh_norm(x, alpha=1.0, beta=1.0, gamma=1.0, delta=1.0, sigma=1.0, mu=0.0, inverse=False, **kwargs):
-    """
-    tanh normalization
-    
-        f(x) = sigma * alpha * tanh((gamma * (x-mu)) / alpha) if (x-mu) >= 0
-        f(x) = sigma * beta  * tanh((delta * (x-mu)) / beta)  if (x-mu) < 0
-    
-    Args:
-        x (tensor): Input tensor
-        alpha (float): Positive saturation limit (upper bound).
-        beta (float): Negative saturation limit (lower bound).
-        gamma (float): Multiplicative gain for the positive side.
-        delta (float): Multiplicative gain for the negative side.
-        sigma (float): Final scaling
-        mu (float): Mean shift / center point.
-        inverse (bool): Toggle between forward and inverse operations.
-
-    Returns:
-        torch.Tensor: normalized data
-        dict: normalization parameters
-    """
-    if not inverse:
-        # Forward: x -> y
-        x_shifted = x - mu
-        pos = alpha * torch.tanh((gamma * x_shifted) / alpha)
-        neg = beta * torch.tanh((delta * x_shifted) / beta)
-        y = torch.where(x_shifted >= 0, pos, neg) * sigma
-    else:
-        # Inverse: y -> x
-        # Note: data (y) should be clamped within (-beta, alpha) for stability
-        y = torch.clamp(x / sigma, -beta + 1e-9, alpha - 1e-9)
-        pos_inv = (alpha * torch.atanh(y / alpha)) / gamma
-        neg_inv = (beta * torch.atanh(y / beta)) / delta
-        y =  torch.where(y >= 0, pos_inv, neg_inv) + mu
-
-    params = {'mu': mu, 'alpha': alpha, 'beta': beta, 'delta': delta, 'gamma': gamma, 'sigma': sigma}
-    return y, params
-
-
-class Normalization(torch.nn.Module):
-    """A data normalization object"""
-
-    def __init__(self, method: str, inplace: bool = False, **kwargs):
-        super().__init__()
-        self.method = method
-        self.inplace = inplace
-        self.kwargs = kwargs
-
-    def forward(self, x, inverse=False):
-        if self.method in ['minmax', 'min-max']:
-            x, kw = minmax_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-            if not inverse:
-                self.kwargs.update(kw)
-
-        elif self.method in ['centermax', 'center-max']:
-            x, kw = center_max_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-            if not inverse:
-                self.kwargs.update(kw)
-
-        elif self.method in ['tanh']:
-            if not inverse:
-                x, kw = center_max_norm(x, inplace=self.inplace, **self.kwargs)
-                self.kwargs.update(kw)
-                x, kw = tanh_norm(x, inplace=self.inplace, **self.kwargs)
-                self.kwargs.update(kw)
-            else:
-                x, _ = tanh_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-                x, _ = center_max_norm(x, inplace=self.inplace, inverse=inverse, **self.kwargs)
-
-        return x
-
-    def inverse(self, x):
-        return self.forward(x, inverse=True)
-
-
 def parse_config_model(config: dict):
     """Instantiate model, optimizer, noise_scheduler, and lr_scheduler from a
     parsed yaml config dict. Any missing keys return ``None``, which will
@@ -442,15 +312,21 @@ def parse_config_model(config: dict):
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
     Returns:
-        tuple: ``(model, optimizer, noise_scheduler, lr_scheduler)`` where any
-        missing component is ``None``.
+        dict: A dictionary with keys ``'model'``, ``'optimizer'``,
+        ``'noise_scheduler'``, ``'lr_scheduler'``.  Each entry is the
+        corresponding instantiated object, or ``None`` if the config did
+        not specify it (or its dependencies could not be built).
 
     Example::
 
         with open("config.yaml") as f:
             config = yaml.safe_load(f)
 
-        model, optimizer, noise_scheduler, lr_scheduler = parse_model(config)
+        out = parse_config_model(config)
+        model = out['model']
+        optimizer = out['optimizer']
+        noise_scheduler = out['noise_scheduler']
+        lr_scheduler = out['lr_scheduler']
     """
     import torch.optim.lr_scheduler as lr_schedulers
 
@@ -482,7 +358,14 @@ def parse_config_model(config: dict):
         lr_cls = getattr(lr_schedulers, config["lr_scheduler"]["class"])
         lr_scheduler = lr_cls(optimizer, **config["lr_scheduler"].get("kwargs", {}))
 
-    return model, optimizer, noise_scheduler, lr_scheduler
+    output = {
+        'model': model,
+        'optimizer': optimizer,
+        'noise_scheduler': noise_scheduler,
+        'lr_scheduler': lr_scheduler
+    }
+
+    return output
 
 
 def parse_config_data(config: dict):
@@ -495,18 +378,28 @@ def parse_config_data(config: dict):
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
     Returns:
-        ArrayDataset: Dataset ready to be passed to ``train()``.
-        Normalization: object that (un) normalizes the data
+        dict: A dictionary with keys
+
+            * ``'data'`` — :class:`ArrayDataset` ready to be passed to
+              ``train()``.
+            * ``'norm'`` — fitted :class:`Normalization` instance, or
+              ``None`` if normalization was not requested.
+            * ``'tform'`` — fitted :class:`Transform` instance, or ``None``
+              if no ``transform`` list was given in the config.
 
     Example::
 
         with open("config.yaml") as f:
             config = yaml.safe_load(f)
 
-        dataset, norm = parse_config_data(config)
+        out = parse_config_data(config)
+        dataset = out['data']
+        norm = out['norm']
+        tform = out['tform']
     """
     import cosmodiff.utils as utils_module
     from cosmodiff.utils import ArrayDataset, load_data
+    from cosmodiff.transform import Transform
 
     data_cfg = config["data"]
     global_cfg = config.get("global", {})
@@ -528,6 +421,7 @@ def parse_config_data(config: dict):
     log = data_cfg.get("log", False)
     normalization = data_cfg.get('normalization', None)
     norm_kwargs = data_cfg.get('norm_kwargs', {})
+    transform = data_cfg.get('transform', None)
 
     _load_kwargs = dict(
         img_read_fn=img_read_fn,
@@ -540,18 +434,23 @@ def parse_config_data(config: dict):
 
     if isinstance(img_path, (list, tuple)):
         n = len(img_path)
-        label_paths = label_path if isinstance(label_path, (list, tuple)) else [label_path] * n
-        n_samples_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
-        seeds_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
+        lbl_paths = label_path if isinstance(label_path, (list, tuple)) else [label_path] * n
+        nsmp_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
+        seed_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
         log_list = log if isinstance(log, (list, tuple)) else [log] * n
         norm_list = normalization if isinstance(normalization, (list, tuple)) else [normalization] * n
         nk_list = norm_kwargs if isinstance(norm_kwargs, (list, tuple)) else [norm_kwargs] * n
+        tf_list = transform if isinstance(transform, (list, tuple)) else [transform] * n
 
         all_images, all_labels = [], []
-        for p, lp, ns, sd, lg, nm, nk in zip(img_path, label_paths, n_samples_list, seeds_list, log_list, norm_list, nk_list):
-            imgs, lbls, norm = load_data(
-                img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, normalization=nm, norm_kwargs=nk, **_load_kwargs
+        for p, lp, ns, sd, lg, nm, nk, tf in zip(img_path, lbl_paths, nsmp_list, seed_list, log_list, norm_list, nk_list, tf_list):
+            output = load_data(
+                img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, normalization=nm, norm_kwargs=nk, transform=tf, **_load_kwargs
                 )
+            imgs = output.get('images', None)
+            lbls = output.get('labels', None)
+            norm = output.get('norm', None)
+            tform = output.get('tform', None)
             all_images.append(imgs)
             if lbls is not None:
                 all_labels.append(lbls)
@@ -560,7 +459,7 @@ def parse_config_data(config: dict):
         labels = torch.cat(all_labels, dim=0) if all_labels else None
 
     else:
-        images, labels, norm = load_data(
+        output = load_data(
             img_path=img_path,
             label_path=label_path,
             n_samples=n_samples,
@@ -568,15 +467,27 @@ def parse_config_data(config: dict):
             log=log,
             normalization=normalization,
             norm_kwargs=norm_kwargs,
+            transform=transform,
             **_load_kwargs,
         )
+
+        images = output.get('images', None)
+        labels = output.get('labels', None)
+        norm = output.get('norm', None)
+        tform = output.get('tform', None)
 
     augmentations = None
     if "augmentations" in config:
         from cosmodiff.augment import config_augmentations
         augmentations = config_augmentations(config["augmentations"])
 
-    return ArrayDataset(images, labels=labels, augmentations=augmentations), norm
+    output = {
+        'data': ArrayDataset(images, labels=labels, augmentations=augmentations),
+        'norm': norm,
+        'tform': tform,
+    }
+
+    return output
 
 
 def npy_read_fn(fname):
