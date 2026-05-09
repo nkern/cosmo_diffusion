@@ -293,10 +293,13 @@ def load_data(
             return output
 
     else:
+        # assume img_path and label_path are single paths
         # --- images ---------------------------------------------------------
         if isinstance(img_path, (np.ndarray, torch.Tensor)):
             images = img_path
         else:
+            assert img_read_fn is not None
+            img_read_fn = globals()[img_read_fn] if isinstance(img_read_fn, str) else img_read_fn
             images = img_read_fn(img_path)
 
         if n_samples is not None:
@@ -318,10 +321,8 @@ def load_data(
             if isinstance(label_path, (np.ndarray, torch.Tensor)):
                 labels = label_path
             else:
-                if label_read_fn is None:
-                    raise ValueError(
-                        "label_read_fn must be provided when label_path is a filepath."
-                    )
+                assert label_read_fn is not None
+                label_read_fn = globals()[label_read_fn] if isinstance(label_read_fn, str) else label_read_fn
                 labels = label_read_fn(label_path)
 
             if n_samples is not None:
@@ -551,25 +552,13 @@ def parse_config_data(config: dict):
         else global_cfg.get("device", "cpu")
 
 
-    img_read_fn = data_cfg.get('img_read_fn', None)
-    label_read_fn = data_cfg.get('label_read_fn', None)
-
-    if isinstance(img_read_fn, (list, tuple)):
-        img_read_fn = [getattr(utils, fn) for fn in img_read_fn]
-    elif img_read_fn is not None:
-        img_read_fn = getattr(utils, img_read_fn)
-    if isinstance(label_read_fn, (list, tuple)):
-        label_read_fn = [getattr(utils, fn) for fn in label_read_fn]
-    elif label_read_fn is not None:
-        label_read_fn = getattr(utils, label_read_fn)
-
     out = load_data(
         img_path=data_cfg["img_path"],
-        img_read_fn=img_read_fn,
+        img_read_fn=data_cfg.get('img_read_fn', None),
         device=device,
         dtype=dtype,
         label_path=data_cfg.get("label_path", None),
-        label_read_fn=label_read_fn,
+        label_read_fn=data_cfg.get('label_read_fn', None),
         reshape=data_cfg.get("reshape", '2d'),
         zthin=data_cfg.get("zthin", 1),
         n_samples=data_cfg.get("n_samples", None),
