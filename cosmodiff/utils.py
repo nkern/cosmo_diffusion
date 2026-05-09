@@ -14,9 +14,9 @@ from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
 import time
 import yaml
-from typing import Optional
+from typing import Optional, Callable
 
-from .transform import Normalization
+from .transform import Normalization, MultiNormalization, Transform, MultiTransform
 
 
 class ArrayDataset(Dataset):
@@ -66,11 +66,11 @@ class ArrayDataset(Dataset):
 
 def load_data(
     img_path: str | np.ndarray | list[str],
-    img_read_fn: callable | list[callable],
+    img_read_fn: Callable | list[Callable],
     device: str | None = None,
     dtype: torch.dtype | None = None,
     label_path: str | np.ndarray | list[str] | None = None,
-    label_read_fn: Optional[callable | list[callable]] = None,
+    label_read_fn: Optional[Callable | list[Callable]] = None,
     reshape: str | None = '2d',
     zthin: int | list[int] = 1,
     n_samples: int | list[int] | None = None,
@@ -165,7 +165,7 @@ def load_data(
             # one norm for all data.
             # first load and concat data, then apply transform / norm
             images, labels = [], []
-            for img, ifn, lbl, lfn, zth, nsm, see, nrm, nkw, trn in zip(
+            for img, ifn, lbl, lfn, zth, nsm, see in zip(
                 img_path,
                 img_read_fn,
                 label_path,
@@ -195,7 +195,7 @@ def load_data(
             # concat
             images = torch.cat(images, dim=0)
             if len(labels) > 0:
-                unq_labels = torch.cat([lbls[0] for lbls in labels])
+                unq_labels = torch.cat([lbls[:1] for lbls in labels])
                 labels = torch.cat(labels, dim=0)
             else:
                 labels = None
@@ -203,13 +203,14 @@ def load_data(
             # pass through again to do transform / normalization
             output = load_data(
                 images,
+                img_read_fn=None,  # images already loaded
                 label_path=labels,
                 device=device,
                 dtype=dtype,
                 reshape=None,
                 normalization=normalization,
                 norm_kwargs=norm_kwargs,
-                transform=transform
+                transform=transform,
             )
 
             return output
@@ -218,7 +219,6 @@ def load_data(
             # one norm for each dataset.
             # load each data, apply tform / norm, then concat.
             # note that this requires labels be supplied.
-            raise NotImplementedError
 
             # modify transform to be list of list if needed
             if transform is not None:
@@ -334,11 +334,15 @@ def load_data(
         # --- reshape --------------------------------------------------------
         if reshape == '2d':
             images = images[:, ::zthin]
+            n_slices_per_vol = images.shape[1]
             images = images.reshape(-1, 1, *images.shape[-2:])
+            # broadcast labels per-slice so they remain 1:1 with the reshaped images
+            if labels is not None:
+                labels = labels.repeat_interleave(n_slices_per_vol, dim=0)
         elif reshape == '3d':
             images = images.unsqueeze(1)
 
-        if only_read:
+        if read_only:
             return {'images': images, 'labels': labels}
 
     # --- transforms -----------------------------------------------------
@@ -513,9 +517,6 @@ def parse_config_model(config: dict):
 def parse_config_data(config: dict):
     """Load data and build an ``ArrayDataset`` from a parsed yaml config dict.
 
-    Read functions are resolved by name from ``cosmodiff.utils``. Any callable
-    in that module can be referenced by name in the yaml config.
-
     Args:
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
@@ -539,9 +540,8 @@ def parse_config_data(config: dict):
         norm = out['norm']
         tform = out['tform']
     """
-    import cosmodiff.utils as utils_module
+    from cosmodiff import utils
     from cosmodiff.utils import ArrayDataset, load_data
-    from cosmodiff.transform import Transform
 
     data_cfg = config["data"]
     global_cfg = config.get("global", {})
@@ -550,73 +550,34 @@ def parse_config_data(config: dict):
     device = "cpu" if data_cfg.get("keep_on_cpu", False) \
         else global_cfg.get("device", "cpu")
 
-    img_read_fn = getattr(utils_module, data_cfg["img_read_fn"])
 
-    label_path = data_cfg.get("label_path", None)
-    label_read_fn = None
-    if "label_read_fn" in data_cfg:
-        label_read_fn = getattr(utils_module, data_cfg["label_read_fn"])
+    img_read_fn = data_cfg.get('img_read_fn', None)
+    label_read_fn = data_cfg.get('label_read_fn', None)
 
-    img_path = data_cfg["img_path"]
-    n_samples = data_cfg.get("n_samples", None)
-    seed = data_cfg.get("seed", None)
-    log = data_cfg.get("log", False)
-    normalization = data_cfg.get('normalization', None)
-    norm_kwargs = data_cfg.get('norm_kwargs', {})
-    transform = data_cfg.get('transform', None)
+    if isinstance(img_read_fn, (list, tuple)):
+        img_read_fn = [getattr(utils, fn) for fn in img_read_fn]
+    elif img_read_fn is not None:
+        img_read_fn = getattr(utils, img_read_fn)
+    if isinstance(label_read_fn, (list, tuple)):
+        label_read_fn = [getattr(utils, fn) for fn in label_read_fn]
+    elif label_read_fn is not None:
+        label_read_fn = getattr(utils, label_read_fn)
 
-    _load_kwargs = dict(
+    out = load_data(
+        img_path=data_cfg["img_path"],
         img_read_fn=img_read_fn,
         device=device,
         dtype=dtype,
+        label_path=data_cfg.get("label_path", None),
         label_read_fn=label_read_fn,
         reshape=data_cfg.get("reshape", '2d'),
         zthin=data_cfg.get("zthin", 1),
+        n_samples=data_cfg.get("n_samples", None),
+        seed=data_cfg.get("seed", None),
+        normalization=data_cfg.get('normalization', None),
+        norm_kwargs=data_cfg.get('norm_kwargs', None),
+        transform=data_cfg.get('transform', None),
     )
-
-    if isinstance(img_path, (list, tuple)):
-        n = len(img_path)
-        lbl_paths = label_path if isinstance(label_path, (list, tuple)) else [label_path] * n
-        nsmp_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
-        seed_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
-        log_list = log if isinstance(log, (list, tuple)) else [log] * n
-        norm_list = normalization if isinstance(normalization, (list, tuple)) else [normalization] * n
-        nk_list = norm_kwargs if isinstance(norm_kwargs, (list, tuple)) else [norm_kwargs] * n
-        tf_list = transform if isinstance(transform, (list, tuple)) else [transform] * n
-
-        all_images, all_labels = [], []
-        for p, lp, ns, sd, lg, nm, nk, tf in zip(img_path, lbl_paths, nsmp_list, seed_list, log_list, norm_list, nk_list, tf_list):
-            output = load_data(
-                img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, normalization=nm, norm_kwargs=nk, transform=tf, **_load_kwargs
-                )
-            imgs = output.get('images', None)
-            lbls = output.get('labels', None)
-            norm = output.get('norm', None)
-            tform = output.get('tform', None)
-            all_images.append(imgs)
-            if lbls is not None:
-                all_labels.append(lbls)
-
-        images = torch.cat(all_images, dim=0)
-        labels = torch.cat(all_labels, dim=0) if all_labels else None
-
-    else:
-        output = load_data(
-            img_path=img_path,
-            label_path=label_path,
-            n_samples=n_samples,
-            seed=seed,
-            log=log,
-            normalization=normalization,
-            norm_kwargs=norm_kwargs,
-            transform=transform,
-            **_load_kwargs,
-        )
-
-        images = output.get('images', None)
-        labels = output.get('labels', None)
-        norm = output.get('norm', None)
-        tform = output.get('tform', None)
 
     augmentations = None
     if "augmentations" in config:
@@ -624,9 +585,11 @@ def parse_config_data(config: dict):
         augmentations = config_augmentations(config["augmentations"])
 
     output = {
-        'data': ArrayDataset(images, labels=labels, augmentations=augmentations),
-        'norm': norm,
-        'tform': tform,
+        'data': ArrayDataset(
+            out['images'], labels=out['labels'], augmentations=augmentations,
+        ),
+        'norm': out['norm'],
+        'tform': out['tform'],
     }
 
     return output
@@ -634,6 +597,10 @@ def parse_config_data(config: dict):
 
 def npy_read_fn(fname):
     return np.load(fname, mmap_mode='r')
+
+
+def txt_read_fn(fname):
+    return np.loadtxt(fname)
 
 
 def read_logs(output_dir: str) -> dict:

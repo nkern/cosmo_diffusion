@@ -11,12 +11,16 @@ io:
 
 # --- data ---
 data:
-  img_path: /path/to/images.npy
-  img_read_fn: npy_read_fn        # any function in cosmodiff.utils
-  label_path: /path/to/labels.npy # optional
-  label_read_fn: npy_read_fn      # optional
-  reshape: 2d                 # '2d' (z-slice → channel), '3d' (volume), or null (no reshape)
-  zthin: 4                    # thinning factor along z when reshape='2d'
+  img_path: 
+    - /path/to/images.npy
+    - /path/to/images2.npy
+  img_read_fn: npy_read_fn        
+  label_path: 
+    - /path/to/labels.npy
+    - /path/to/labels.npy
+  label_read_fn: npy_read_fn
+  two_dim: true
+  zthin: 4
   n_samples: null
   seed: null
   keep_on_cpu: true
@@ -27,7 +31,7 @@ data:
     alpha: null
     beta: null
   transform:
-    [log, rfft2]
+    [log]
 
 # --- augmentations ---
 augmentations:

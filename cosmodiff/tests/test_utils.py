@@ -7,17 +7,19 @@ from cosmodiff.utils import (
     ArrayDataset,
     load_data,
     npy_read_fn,
+    txt_read_fn,
     parse_config_model,
     parse_config_data,
     read_config,
     write_metrics,
     read_metrics,
 )
-from cosmodiff.transform import Normalization
+from cosmodiff.transform import Normalization, MultiNormalization, Transform, MultiTransform
 from cosmodiff.data import DATA_PATH
 
 CONFIG_PATH = DATA_PATH / 'config.yaml'
 SIM_PATH = DATA_PATH / 'IllustrisTNG_Mcdm.npy'
+PARAMS_PATH = DATA_PATH / 'params_Illustris.txt'
 # shape: (34, 32, 32, 32), dtype: float32
 DATA_N, DATA_NZ, DATA_NX, DATA_NY = 34, 32, 32, 32
 
@@ -31,10 +33,10 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
-    images_all = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, two_dim=False)['images']
+    images_all = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, reshape="3d")['images']
     assert images_all.shape[0] == DATA_N
 
-    images_sub = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, two_dim=False)['images']
+    images_sub = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, reshape="3d")['images']
     assert images_sub.shape[0] == 3
 
     for i in range(len(images_sub)):
@@ -52,7 +54,7 @@ def test_n_samples_labels_in_sync():
         arr, img_read_fn=None,
         label_path=labels, label_read_fn=None,
         n_samples=7, seed=0,
-        normalization=None, two_dim=False,
+        normalization=None, reshape="3d",
     )
     images, out_labels = out['images'], out['labels']
     assert images.shape[0] == 7
@@ -65,19 +67,69 @@ def test_n_samples_labels_in_sync():
 
 
 def test_seed():
-    imgs1 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)['images']
-    imgs2 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, two_dim=False)['images']
-    imgs3 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, two_dim=False)['images']
+    imgs1 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, reshape="3d")['images']
+    imgs2 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, reshape="3d")['images']
+    imgs3 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, reshape="3d")['images']
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
 
 def test_memmap():
     mmap = np.load(SIM_PATH, mmap_mode="r")
-    images_all = load_data(mmap, img_read_fn=None, normalization=None, two_dim=False)['images']
-    images_sub = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, two_dim=False)['images']
+    images_all = load_data(mmap, img_read_fn=None, normalization=None, reshape="3d")['images']
+    images_sub = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, reshape="3d")['images']
     assert images_all.shape[0] == DATA_N
     assert images_sub.shape[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# load_data: multi-path returns the right (Multi)Normalization / (Multi)Transform
+# ---------------------------------------------------------------------------
+
+def test_load_data_multipath_norm_transform_types():
+    """Two img_paths + two label_paths exercising the two normalization modes.
+
+    Mode A — single normalization / transform shared across all paths
+        → ``out['norm']`` is :class:`Normalization`
+        → ``out['tform']`` is :class:`Transform`
+
+    Mode B — list-shaped normalization / transform (one per path)
+        → ``out['norm']`` is :class:`MultiNormalization`
+        → ``out['tform']`` is :class:`MultiTransform`
+    """
+    img_paths = [str(SIM_PATH), str(SIM_PATH)]
+    label_paths = [str(PARAMS_PATH), str(PARAMS_PATH)]
+
+    # --- Case (i): scalar normalization / transform ---
+    out_a = load_data(
+        img_path=img_paths,
+        img_read_fn=npy_read_fn,
+        label_path=label_paths,
+        label_read_fn=txt_read_fn,
+        reshape='2d',
+        zthin=4,
+        normalization='min-max',
+        transform=['log'],
+    )
+    assert isinstance(out_a['norm'], Normalization)
+    assert not isinstance(out_a['norm'], MultiNormalization)
+    assert isinstance(out_a['tform'], Transform)
+    assert not isinstance(out_a['tform'], MultiTransform)
+
+    # --- Case (ii): per-path normalization / transform ---
+    out_b = load_data(
+        img_path=img_paths,
+        img_read_fn=npy_read_fn,
+        label_path=label_paths,
+        label_read_fn=txt_read_fn,
+        reshape='2d',
+        zthin=4,
+        normalization=['min-max', 'min-max'],
+        norm_kwargs=[{}, {}],
+        transform=[['log'], ['log']],
+    )
+    assert isinstance(out_b['norm'], MultiNormalization)
+    assert isinstance(out_b['tform'], MultiTransform)
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +218,8 @@ def test_parse_config_data():
         "data": {
             "img_path": img_path,
             "img_read_fn": "npy_read_fn",
-            "log": False,
-            "norm": "min-max",
-            "two_dim": True,
+            "normalization": "min-max",
+            "reshape": "2d",
             "zthin": 1,
             "keep_on_cpu": True,
         },

@@ -707,11 +707,10 @@ def test_train_script():
         "data": {
             "img_path": str(SIM_PATH),
             "img_read_fn": "npy_read_fn",
-            "two_dim": True,
+            "reshape": "2d",
             "zthin": 4,
             "n_samples": 8,
             "keep_on_cpu": True,
-            "log": False,
             "normalization": "center-max",
             "norm_kwargs": {"center": None, "xmax": None, "alpha": None, "beta": None},
         },
@@ -750,6 +749,85 @@ def test_train_script():
         config_path = os.path.join(tmp_dir, "config.yaml")
         with open(config_path, "w") as f:
             yaml.dump(minimal_config, f)
+
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["cosmodiff_train.py", "--config", config_path]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        metrics_files = [
+            f for f in os.listdir(tmp_dir) if f.startswith("metrics_epoch_")
+        ]
+        assert len(metrics_files) == 1, f"expected 1 metrics file, got {metrics_files}"
+
+
+def test_train_script_multipath():
+    """cosmodiff_train.py main() runs end-to-end on a multi-path config.
+    """
+    import sys
+    import yaml
+    from scripts.cosmodiff_train import main
+
+    multipath_cfg_path = DATA_PATH / 'config_multipath.yaml'
+    with open(multipath_cfg_path) as f:
+        config = yaml.safe_load(f)
+
+    # --- override data paths and read fns for the bundled test data ---
+    config["data"]["img_path"] = [str(SIM_PATH), str(SIM_PATH)]
+    config["data"]["label_path"] = [str(PARAMS_PATH), str(PARAMS_PATH)]
+    config["data"]["img_read_fn"] = "npy_read_fn"
+    config["data"]["label_read_fn"] = "txt_read_fn"
+    # the shipped config still uses the legacy 'two_dim' key — replace it
+    config["data"].pop("two_dim", None)
+    config["data"]["reshape"] = "2d"
+    config["data"]["zthin"] = 4
+    config["data"]["normalization"] = "min-max"
+    config["data"]["transform"] = None  # log on cosmology data is fine but unrelated to this test
+    config["data"]["keep_on_cpu"] = True
+
+    # --- shrink model to test scale ---
+    config["model"] = {
+        "class": "UNet2DConditionModel",
+        "kwargs": {
+            "sample_size": 64,
+            "in_channels": 1,
+            "out_channels": 1,
+            "layers_per_block": 1,
+            "block_out_channels": [16, 16],
+            "down_block_types": ["DownBlock2D", "DownBlock2D"],
+            "up_block_types": ["UpBlock2D", "UpBlock2D"],
+            "norm_num_groups": 8,
+            "cross_attention_dim": 16,
+            "encoder_hid_dim": N_PARAMS,
+        },
+    }
+    config["noise_scheduler"] = {
+        "class": "DDPMScheduler",
+        "kwargs": {"num_train_timesteps": 10},
+    }
+    config["augmentations"] = {}
+
+    # --- shrink training schedule ---
+    config["train"].update({
+        "num_epochs": 2,
+        "batch_size": 4,
+        "mixed_precision": "no",
+        "checkpoint_every_n_epochs": 2,
+        "force_cpu": True,
+        "verbose": False,
+        "conditioning": "continuous",  # cosmology params are 6-D float vectors
+        "ema_sigma_rels": None,
+        "ema_burn_in": 0,
+        "dataloader_num_workers": 0,
+    })
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config["io"]["output_dir"] = tmp_dir
+        config_path = os.path.join(tmp_dir, "config_multipath.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(config, f)
 
         orig_argv = sys.argv
         try:
