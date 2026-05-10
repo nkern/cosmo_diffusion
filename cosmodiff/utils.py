@@ -148,11 +148,12 @@ def load_data(
     """
     # first check if feeding lists of filepaths
     if isinstance(img_path, (list, tuple)):
-        if label_path is not None:
-            assert isinstance(label_path, (list, tuple))
 
-        # list of filepaths: assumes label_path is also list
+        # list of filepaths: assumes label_path is also list if provided
         n = len(img_path)
+        if label_path is None:
+            label_path = [label_path] * n
+        assert isinstance(label_path, (list, tuple))
         img_read_fn = img_read_fn if isinstance(img_read_fn, (list, tuple)) else [img_read_fn] * n
         label_read_fn = label_read_fn if isinstance(label_read_fn, (list, tuple)) else [label_read_fn] * n
         zthin = zthin if isinstance(zthin, (list, tuple)) else [zthin] * n
