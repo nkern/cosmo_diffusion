@@ -148,7 +148,8 @@ def load_data(
     """
     # first check if feeding lists of filepaths
     if isinstance(img_path, (list, tuple)):
-        assert isinstance(label_path, (list, tuple))
+        if label_path is not None:
+            assert isinstance(label_path, (list, tuple))
 
         # list of filepaths: assumes label_path is also list
         n = len(img_path)
@@ -310,8 +311,9 @@ def load_data(
                 idx = rng.choice(len(images), size=n_samples, replace=False)
             images = images[idx]
         else:
-            # images may be a memory-mapped array, so slice to instantiate it
-            images = images[:]
+            if isinstance(images, np.ndarray) and not images.flags.writeable:
+                # may be memory-mapped ndarray, so make a copy
+                images = np.asarray(images, copy=True)
 
         images = torch.as_tensor(images, device=device, dtype=dtype)
 
