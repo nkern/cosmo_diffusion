@@ -1,4 +1,5 @@
 import os
+import inspect
 import pickle
 import yaml
 import numpy as np
@@ -637,6 +638,10 @@ def generate(
     guidance_scale: Optional[float] = None,
     conditioning: str = 'discrete',
     num_steps: Optional[int] = None,
+    s_churn: Optional[float] = None,
+    s_tmin: Optional[float] = None,
+    s_tmax: Optional[float] = None,
+    s_noise: Optional[float] = None,
     renorm: Optional[Callable] = None,
     device: Optional[torch.device] = None,
     generator: Optional[torch.Generator] = None,
@@ -671,6 +676,22 @@ def generate(
             ``noise_scheduler.config.num_train_timesteps`` (full schedule).
             Use a smaller value with a higher-order solver (DDIM, DPM-Solver,
             Heun, etc.) for fast sampling.
+        s_churn (float, optional): EDM-style stochasticity injection
+            (Karras et al. 2022).  ``0`` (the scheduler default) gives pure
+            ODE sampling; larger values inject more noise at each step,
+            interpolating toward SDE-like behavior.  Only consumed by
+            schedulers that accept it (Euler/Heun-family, including the
+            flow-matching variants); silently dropped for schedulers that
+            don't (DDPM, DDIM, DPM-Solver, etc.).
+        s_tmin (float, optional): Lower-bound timestep for churn gating.
+            Churn is only applied when ``t >= s_tmin``. Same compatibility
+            rules as ``s_churn``.
+        s_tmax (float, optional): Upper-bound timestep for churn gating.
+            Churn is only applied when ``t <= s_tmax``. Same compatibility
+            rules as ``s_churn``.
+        s_noise (float, optional): Multiplier on the magnitude of injected
+            noise during churn (default ``1.0`` in diffusers).  Same
+            compatibility rules as ``s_churn``.
         renorm (callable, optional): Applied to the output tensor to convert
             images back to their original range (e.g. inverse of the
             normalization used at training time).
@@ -713,6 +734,19 @@ def generate(
         else:
             null_labels = torch.zeros_like(labels)
 
+    # Filter EDM-style stochasticity kwargs to those this scheduler's
+    # `step()` actually accepts (Euler/Heun-family, including FM variants).
+    # Unsupported keys are silently dropped so the same generate() call
+    # works across all scheduler types.
+    step_supported = set(inspect.signature(noise_scheduler.step).parameters)
+    step_kwargs = {
+        k: v for k, v in (
+            ('s_churn', s_churn), ('s_tmin', s_tmin),
+            ('s_tmax', s_tmax),   ('s_noise', s_noise),
+        )
+        if v is not None and k in step_supported
+    }
+
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
         # FM schedulers use float timesteps; DDPM-family use int — preserve dtype.
         timesteps = torch.full((batch_size,), t.item() if hasattr(t, 'item') else t,
@@ -727,7 +761,9 @@ def generate(
         else:
             pred = model(images, timesteps, return_dict=False)[0]
 
-        images = noise_scheduler.step(pred, t, images, generator=generator).prev_sample
+        images = noise_scheduler.step(
+            pred, t, images, generator=generator, **step_kwargs,
+        ).prev_sample
 
     if renorm is not None:
         images = renorm(images)

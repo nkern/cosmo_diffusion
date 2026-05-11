@@ -115,6 +115,33 @@ def main():
              "num_train_timesteps (full schedule).",
     )
     parser.add_argument(
+        "--s_churn",
+        type=float,
+        default=None,
+        help="EDM-style stochasticity injection (Karras et al. 2022). "
+             "0 = pure ODE; larger = more SDE-like. Only consumed by "
+             "Euler/Heun-family schedulers (diffusion or FM); silently "
+             "ignored for others (DDPM, DDIM, DPM-Solver, etc.).",
+    )
+    parser.add_argument(
+        "--s_tmin",
+        type=float,
+        default=None,
+        help="Lower-bound timestep for churn gating; ignored when --s_churn is unset.",
+    )
+    parser.add_argument(
+        "--s_tmax",
+        type=float,
+        default=None,
+        help="Upper-bound timestep for churn gating; ignored when --s_churn is unset.",
+    )
+    parser.add_argument(
+        "--s_noise",
+        type=float,
+        default=None,
+        help="Multiplier on injected noise magnitude during churn (default 1.0).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -255,6 +282,10 @@ def main():
             guidance_scale=args.guidance_scale,
             conditioning=args.conditioning,
             num_steps=args.num_steps,
+            s_churn=args.s_churn,
+            s_tmin=args.s_tmin,
+            s_tmax=args.s_tmax,
+            s_noise=args.s_noise,
             device=device,
             generator=generator,
         )

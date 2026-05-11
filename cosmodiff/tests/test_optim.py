@@ -7,6 +7,7 @@ from diffusers import (
     UNet2DConditionModel,
     DDPMScheduler,
     DDIMScheduler,
+    EulerDiscreteScheduler,
     DiTTransformer2DModel,
     PixArtTransformer2DModel,
     FlowMatchEulerDiscreteScheduler,
@@ -757,6 +758,46 @@ def test_generate_flow_matching():
     model = _make_unet()
     scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=10)
     images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_euler():
+    """s_churn is forwarded to EulerDiscreteScheduler.step and produces finite output."""
+    model = _make_unet()
+    scheduler = EulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8), num_steps=5,
+        s_churn=10.0, s_tmin=0.0, s_tmax=float('inf'), s_noise=1.0,
+    )
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_flow_match():
+    """s_churn is also accepted by FlowMatchEulerDiscreteScheduler."""
+    model = _make_unet()
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8), num_steps=5,
+        s_churn=5.0,
+    )
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_silently_dropped_for_ddpm():
+    """s_churn is silently dropped for schedulers that don't accept it (no error)."""
+    model = _make_unet()
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    # DDPMScheduler.step doesn't accept s_churn; this should not raise.
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8),
+        s_churn=10.0, s_noise=2.0,
+    )
     assert images.shape == (2, 1, 8, 8)
     assert torch.isfinite(images).all()
 

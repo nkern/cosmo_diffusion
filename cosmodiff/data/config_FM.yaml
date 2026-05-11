@@ -27,7 +27,7 @@ data:
     alpha: null
     beta: null
   transform:
-    [log, fft2]
+    [log]
 
 # --- augmentations ---
 augmentations:
@@ -103,6 +103,10 @@ train:
 generate:
   scheduler: null              # e.g. FlowMatchHeunDiscreteScheduler for 2nd-order ODE; null → use training scheduler
   num_steps: null              # number of inference steps, default is training steps; FM works at 20-50 typically
+  s_churn: null                # EDM stochasticity (Euler/Heun-family only); 0=ODE, larger=more SDE-like
+  s_tmin: null                 # restrict churn to t >= s_tmin
+  s_tmax: null                 # restrict churn to t <= s_tmax
+  s_noise: null                # noise magnitude multiplier during churn (default 1.0)
   n_samples: 64                # total number of samples to generate
   batch_size: null             # samples per forward pass; null → single batch of n_samples
   image_shape: null            # e.g. [1, 64, 64]; null → inferred from model.config
