@@ -752,14 +752,25 @@ def generate(
         timesteps = torch.full((batch_size,), t.item() if hasattr(t, 'item') else t,
                                device=device, dtype=t.dtype if hasattr(t, 'dtype') else torch.long)
 
+        # Rescale the state into the form the model expects (identity for
+        # VP/DDIM/DPM-Solver/FlowMatch, division by √(σ²+1) for Euler/Heun
+        # on VP-trained models).  Pass scaled to the model; pass unscaled
+        # `images` to scheduler.step which integrates in its native space.
+        # FlowMatch schedulers don't define scale_model_input at all, so
+        # we fall through to identity in that case.
+        if hasattr(noise_scheduler, 'scale_model_input'):
+            images_input = noise_scheduler.scale_model_input(images, t)
+        else:
+            images_input = images
+
         if labels is not None:
             cond_key = 'class_labels' if conditioning == 'discrete' else 'encoder_hidden_states'
-            pred = model(images, timestep=timesteps, return_dict=False, **{cond_key: labels})[0]
+            pred = model(images_input, timestep=timesteps, return_dict=False, **{cond_key: labels})[0]
             if null_labels is not None:
-                uncond_pred = model(images, timestep=timesteps, return_dict=False, **{cond_key: null_labels})[0]
+                uncond_pred = model(images_input, timestep=timesteps, return_dict=False, **{cond_key: null_labels})[0]
                 pred = uncond_pred + guidance_scale * (pred - uncond_pred)
         else:
-            pred = model(images, timesteps, return_dict=False)[0]
+            pred = model(images_input, timesteps, return_dict=False)[0]
 
         images = noise_scheduler.step(
             pred, t, images, generator=generator, **step_kwargs,
