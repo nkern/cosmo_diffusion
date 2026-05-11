@@ -304,7 +304,7 @@ class Transform(torch.nn.Module):
         return x
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(ops={self.ops})"
+        return f"{self.__class__.__name__}(log={self.log}, ops={self.ops})"
 
 
 class MultiTransform(torch.nn.Module):
