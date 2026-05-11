@@ -24,6 +24,163 @@ def _to_yaml_safe(obj):
     return obj
 
 
+def _is_flow_matching(scheduler) -> bool:
+    """True if ``scheduler`` is a flow-matching variant.
+
+    Detects ``FlowMatchEulerDiscreteScheduler``, ``FlowMatchHeunDiscreteScheduler``,
+    and any future ``FlowMatch*`` scheduler in ``diffusers``. The branching in
+    :func:`train` keys off this to use linear interpolation + velocity target
+    instead of the DDPM-style ``add_noise`` + ``prediction_type`` switch.
+    """
+    return type(scheduler).__name__.startswith('FlowMatch')
+
+
+def sample_timesteps(
+    scheduler,
+    batch_size: int,
+    device: str = 'cpu',
+    sigma_log_normal: Optional[tuple] = None,
+    log_sigma_schedule: Optional[torch.Tensor] = None,
+):
+    """Sample per-batch timesteps for training.
+
+    Dispatches on the scheduler family.  For flow-matching schedulers,
+    samples an interpolation parameter ``sigma`` in ``[0, 1]`` (uniformly
+    by default, or via a logit-normal if ``sigma_log_normal`` is given,
+    matching the SD3-style training distribution).  For diffusion
+    schedulers, samples integer timesteps in ``[0, T)`` — uniformly by
+    default, or via EDM-style log-σ sampling backed by
+    ``log_sigma_schedule``.
+
+    Args:
+        scheduler: A ``diffusers`` scheduler.  Flow-matching variants are
+            detected by class name (``FlowMatch*``); all other schedulers
+            are treated as DDPM-style.  Used to read
+            ``scheduler.config.num_train_timesteps`` (denoted ``T``) and
+            to determine the timestep dtype convention.
+        batch_size (int): Number of timesteps to sample (one per batch item).
+        device: Target device for the returned tensors (e.g. ``'cpu'``,
+            ``'cuda'``, or a ``torch.device``).
+        sigma_log_normal (tuple of float, optional): ``(P_mean, P_std)``.
+            Under flow matching, samples are drawn as
+            ``sigmoid(P_mean + P_std * randn)`` (SD3-style logit-normal
+            ``t`` distribution).  Under diffusion, samples are drawn as
+            ``log σ ~ Normal(P_mean, P_std)`` and mapped to the nearest
+            discrete timestep via ``log_sigma_schedule``.  ``None``
+            (default) uses uniform sampling.
+        log_sigma_schedule (torch.Tensor, optional): Precomputed
+            ``log σ`` values for the diffusion scheduler at each integer
+            timestep (shape ``(T,)``, monotonically increasing in ``t``).
+            Required only when ``sigma_log_normal`` is set and the
+            scheduler is *not* flow matching; ignored otherwise.
+
+    Returns:
+        tuple: ``(timesteps, sigma)``.
+
+            * ``timesteps`` (torch.Tensor of shape ``(batch_size,)``):
+              for diffusion, an integer ``long`` tensor in ``[0, T)``;
+              for flow matching, a float tensor in ``[0, T)`` (equal to
+              ``sigma * T``).
+            * ``sigma`` (torch.Tensor of shape ``(batch_size,)`` or
+              ``None``): the FM interpolant in ``[0, 1]`` when
+              ``scheduler`` is flow matching; ``None`` for diffusion
+              schedulers (which don't expose a sigma at this stage).
+    """
+    T = scheduler.config.num_train_timesteps
+    if _is_flow_matching(scheduler):
+        # FM: sample sigma in [0, 1] (optionally logit-normal à la SD3)
+        if sigma_log_normal is not None:
+            P_mean, P_std = sigma_log_normal
+            sigma = torch.sigmoid(P_mean + P_std * torch.randn(batch_size, device=device))
+        else:
+            sigma = torch.rand(batch_size, device=device)
+        timesteps = (sigma * T).clamp(0, T - 1)
+        return timesteps, sigma
+
+    # diffusion branch
+    if sigma_log_normal is not None and log_sigma_schedule is not None:
+        P_mean, P_std = sigma_log_normal
+        log_sigma = P_mean + P_std * torch.randn(batch_size, device=device)
+        sched = log_sigma_schedule.to(device)
+        log_sigma = torch.clamp(log_sigma, sched.min().item(), sched.max().item())
+        timesteps = torch.searchsorted(sched, log_sigma)
+        timesteps = torch.clamp(timesteps, 0, T - 1).long()
+    else:
+        timesteps = torch.randint(0, T, (batch_size,), device=device).long()
+    return timesteps, None
+
+
+def noise_and_target(
+    scheduler,
+    samples: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    sigma: Optional[torch.Tensor] = None,
+):
+    """Compute ``(noisy_samples, target)`` for one training step.
+
+    Dispatches on the scheduler family.  For flow-matching schedulers the
+    noisy sample is a linear interpolation between data and noise via
+    ``sigma``, and the target is the constant velocity field
+    ``noise - samples``.  For diffusion schedulers the noisy sample is
+    produced by ``scheduler.add_noise`` and the target depends on
+    ``scheduler.config.prediction_type`` (``epsilon``, ``v_prediction``,
+    or ``sample``).
+
+    Args:
+        scheduler: A ``diffusers`` scheduler.  Flow-matching variants are
+            detected by class name (``FlowMatch*``).  For diffusion
+            schedulers, ``scheduler.config.prediction_type`` selects the
+            target form and ``scheduler.add_noise`` /
+            ``scheduler.get_velocity`` provide the noised sample and
+            ``v_prediction`` target respectively.
+        samples (torch.Tensor): Clean training samples of shape
+            ``(B, ...)``.  For 2D images this is typically
+            ``(B, C, H, W)``.
+        noise (torch.Tensor): Gaussian noise tensor with the same shape
+            and dtype as ``samples`` (typically drawn from
+            ``torch.randn_like(samples)``).
+        timesteps (torch.Tensor): Per-batch timesteps of shape ``(B,)``
+            as returned by :func:`sample_timesteps`.  Integer dtype for
+            diffusion, float for flow matching.
+        sigma (torch.Tensor, optional): The FM interpolant of shape
+            ``(B,)`` in ``[0, 1]``, as returned by :func:`sample_timesteps`
+            for flow-matching schedulers.  Required when ``scheduler`` is
+            flow matching; ignored otherwise.
+
+    Returns:
+        tuple: ``(noisy_samples, target)``, both ``torch.Tensor`` with the
+        same shape and dtype as ``samples``.
+
+            * ``noisy_samples``: input fed to the model (the network's
+              ``x_t``).
+            * ``target``: the regression target for the MSE loss.
+
+    Raises:
+        ValueError: If ``scheduler`` is a diffusion scheduler with an
+            unsupported ``prediction_type``.
+    """
+    if _is_flow_matching(scheduler):
+        # Flow Matching
+        sigma_b = sigma.view(-1, *[1] * (samples.ndim - 1))
+        noisy = sigma_b * noise + (1.0 - sigma_b) * samples
+        target = noise - samples
+        return noisy, target
+
+    # DDPM
+    noisy = scheduler.add_noise(samples, noise, timesteps)
+    prediction_type = scheduler.config.prediction_type
+    if prediction_type == 'epsilon':
+        target = noise
+    elif prediction_type == 'v_prediction':
+        target = scheduler.get_velocity(samples, noise, timesteps)
+    elif prediction_type == 'sample':
+        target = samples
+    else:
+        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+    return noisy, target
+
+
 def train(
     dataset,
     model=None,
@@ -283,8 +440,10 @@ def train(
         cfg_null_token = accelerator.unwrap_model(model).config.num_class_embeds - 1
 
     # precompute log-σ schedule for EDM-style log-normal sigma sampling
+    # (only meaningful for diffusion schedulers; FM uses sigma_log_normal as
+    # logit-normal `t` parameters directly — no schedule lookup needed)
     log_sigma_schedule = None
-    if sigma_log_normal is not None:
+    if sigma_log_normal is not None and not _is_flow_matching(noise_scheduler):
         alphas_cumprod = noise_scheduler.alphas_cumprod.clamp(min=1e-10)
         log_sigma_schedule = 0.5 * torch.log((1.0 - alphas_cumprod) / alphas_cumprod)
         # monotonically increasing in t; we'll map sampled log-σ to nearest t via searchsorted
@@ -328,24 +487,18 @@ def train(
             t0 = time.time()
 
             with accelerator.accumulate(model):
-                # --- forward diffusion ----------------------------------
+                # --- forward diffusion (or FM linear interpolation) -----
                 noise = torch.randn_like(images)
-                if sigma_log_normal is not None:
-                    # EDM-style log-normal sigma sampling: log σ ~ N(P_mean, P_std)
-                    P_mean, P_std = sigma_log_normal
-                    log_sigma = P_mean + P_std * torch.randn(images.shape[0], device=images.device)
-                    sched = log_sigma_schedule.to(images.device)
-                    log_sigma = torch.clamp(log_sigma, sched.min().item(), sched.max().item())
-                    timesteps = torch.searchsorted(sched, log_sigma)
-                    timesteps = torch.clamp(timesteps, 0, noise_scheduler.config.num_train_timesteps - 1).long()
-                else:
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (images.shape[0],),
-                        device=images.device,
-                    ).long()
-                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+                timesteps, sigma = sample_timesteps(
+                    noise_scheduler,
+                    images.shape[0],
+                    device=images.device,
+                    sigma_log_normal=sigma_log_normal,
+                    log_sigma_schedule=log_sigma_schedule,
+                )
+                noisy_images, target = noise_and_target(
+                    noise_scheduler, images, noise, timesteps, sigma=sigma,
+                )
 
                 # --- predict noise --------------------------------------
                 with accelerator.autocast():
@@ -361,20 +514,13 @@ def train(
                     else:
                         pred = model(noisy_images, timesteps, return_dict=False)[0]
 
-                    prediction_type = noise_scheduler.config.prediction_type
-                    if prediction_type == 'epsilon':
-                        target = noise
-                    elif prediction_type == 'v_prediction':
-                        target = noise_scheduler.get_velocity(images, noise, timesteps)
-                    elif prediction_type == 'sample':
-                        target = images
-                    else:
-                        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
-
-                    if min_snr_gamma is None:
+                    if min_snr_gamma is None or _is_flow_matching(noise_scheduler):
+                        # Min-SNR is a DDPM-style weighting and does not apply
+                        # to flow matching — use plain MSE in that case.
                         loss = F.mse_loss(pred, target)
                     else:
                         # Min-SNR loss weighting (Hang et al. 2023). SNR = α_bar / (1 - α_bar).
+                        prediction_type = noise_scheduler.config.prediction_type
                         alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
                         snr = alphas_cumprod[timesteps] / (1.0 - alphas_cumprod[timesteps])
                         clipped_snr = torch.clamp(snr, max=min_snr_gamma)
@@ -568,7 +714,9 @@ def generate(
             null_labels = torch.zeros_like(labels)
 
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
-        timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        # FM schedulers use float timesteps; DDPM-family use int — preserve dtype.
+        timesteps = torch.full((batch_size,), t.item() if hasattr(t, 'item') else t,
+                               device=device, dtype=t.dtype if hasattr(t, 'dtype') else torch.long)
 
         if labels is not None:
             cond_key = 'class_labels' if conditioning == 'discrete' else 'encoder_hidden_states'

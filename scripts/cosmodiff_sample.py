@@ -5,8 +5,11 @@ Usage:
     python cosmodiff_sample.py --checkpoint path/to/checkpoint --n_samples 100 --output samples.npy
     python cosmodiff_sample.py --output_dir path/to/run --n_samples 64 --image_shape 1 64 64
 
-Fast sampling:
+Fast sampling (diffusion-trained models):
     --scheduler DPMSolverMultistepScheduler --num_steps 25
+
+Fast sampling (flow-matching-trained models):
+    --scheduler FlowMatchHeunDiscreteScheduler --num_steps 25
 
 EMA:
     --ema_sigma_rel 0.05  → synthesize EMA at target sigma_rel (uses all checkpoints in output_dir)

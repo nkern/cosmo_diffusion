@@ -2,7 +2,15 @@ import os
 import tempfile
 import numpy as np
 import torch
-from diffusers import UNet2DModel, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel, PixArtTransformer2DModel
+from diffusers import (
+    UNet2DModel,
+    UNet2DConditionModel,
+    DDPMScheduler,
+    DDIMScheduler,
+    DiTTransformer2DModel,
+    PixArtTransformer2DModel,
+    FlowMatchEulerDiscreteScheduler,
+)
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
 from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder, synthesize_ema_from_checkpoints, compute_ema_profiles, load_ema_snapshot
 from cosmodiff.augment import RandomRoll, RandomFlip
@@ -695,6 +703,64 @@ def test_train_min_snr_weighting():
                 f"non-finite loss with min_snr_gamma + prediction_type={prediction_type}"
 
 
+def test_train_flow_matching_basic():
+    """train() with FlowMatchEulerDiscreteScheduler runs the FM noising/target
+    path and produces finite losses with weights that have moved."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(16, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        initial_weight = model.conv_in.weight.data.clone()
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['epoch_loss'])
+        assert not torch.allclose(model.conv_in.weight.data, initial_weight)
+
+
+def test_train_flow_matching_min_snr_is_noop():
+    """min_snr_gamma is a DDPM-only weighting; setting it for FM must not error."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            min_snr_gamma=5.0,  # should be silently ignored for FM
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+
+
+def test_train_flow_matching_sigma_log_normal():
+    """sigma_log_normal is interpreted as logit-normal t parameters under FM."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            sigma_log_normal=(0.0, 1.0),
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+
+
+def test_generate_flow_matching():
+    """generate() works with a FlowMatchEulerDiscreteScheduler-trained model."""
+    model = _make_unet()
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
 def test_train_script():
     """cosmodiff_train.py main() runs end-to-end and writes a metrics file."""
     import sys
@@ -914,6 +980,45 @@ def test_sample_script_with_ema():
                 "--device", "cpu",
                 "--output", out_npy,
                 "--ema_sigma_rel", "0.05",
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy)
+        arr = np.load(out_npy)
+        assert arr.shape == (2, 1, 8, 8)
+        assert np.isfinite(arr).all()
+
+
+def test_sample_script_flow_matching():
+    """cosmodiff_sample.py runs end-to-end against a FM-trained checkpoint."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples_fm.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "2",
+                "--image_shape", "1", "8", "8",
+                "--num_steps", "5",
+                "--device", "cpu",
+                "--output", out_npy,
                 "--seed", "0",
             ]
             main()
