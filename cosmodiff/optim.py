@@ -490,16 +490,17 @@ def generate(
     labels: Optional[torch.Tensor] = None,
     guidance_scale: Optional[float] = None,
     conditioning: str = 'discrete',
-    ddim_thinning: Optional[int] = None,
+    num_steps: Optional[int] = None,
     renorm: Optional[Callable] = None,
     device: Optional[torch.device] = None,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Generate a batch of novel images via reverse diffusion.
 
-    Compatible with DDPMScheduler and DDIMScheduler. The number of inference
-    steps defaults to ``noise_scheduler.config.num_train_timesteps``, or can
-    be reduced via ``ddim_thinning`` for faster DDIM sampling.
+    Compatible with any ``diffusers`` scheduler exposing
+    ``set_timesteps`` / ``step``. The number of inference steps defaults to
+    ``noise_scheduler.config.num_train_timesteps`` and can be reduced via
+    ``num_steps`` for faster sampling (DDIM, DPM-Solver, Heun, etc.).
 
     Args:
         model: Trained diffusers model (UNet2DModel or DiTTransformer2DModel).
@@ -519,10 +520,11 @@ def generate(
         conditioning (str): Matches the mode used during training.
             ``'discrete'`` (default) for integer class labels;
             ``'continuous'`` for continuous float labels.
-        ddim_thinning (int, optional): Thinning factor relative to
-            ``num_train_timesteps``. E.g. ``ddim_thinning=10`` with 1000
-            training steps runs 100 inference steps. Only meaningful with
-            DDIMScheduler; ignored (``None``) for DDPM.
+        num_steps (int, optional): Number of inference steps to run. Passed
+            directly to ``noise_scheduler.set_timesteps``. Defaults to
+            ``noise_scheduler.config.num_train_timesteps`` (full schedule).
+            Use a smaller value with a higher-order solver (DDIM, DPM-Solver,
+            Heun, etc.) for fast sampling.
         renorm (callable, optional): Applied to the output tensor to convert
             images back to their original range (e.g. inverse of the
             normalization used at training time).
@@ -540,7 +542,7 @@ def generate(
 
     model.eval()
     num_train_timesteps = noise_scheduler.config.num_train_timesteps
-    num_inference_steps = num_train_timesteps // ddim_thinning if ddim_thinning is not None else num_train_timesteps
+    num_inference_steps = num_steps if num_steps is not None else num_train_timesteps
     noise_scheduler.set_timesteps(num_inference_steps)
 
     images = torch.randn(

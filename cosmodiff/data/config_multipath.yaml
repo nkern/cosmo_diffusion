@@ -105,6 +105,8 @@ train:
 
 # --- generation ---
 generate:
+  scheduler: null              # new scheduler for inference, default is train scheduler
+  num_steps: null              # number of inference steps, default is training steps
   n_samples: 64                # total number of samples to generate
   batch_size: null             # samples per forward pass; null → single batch of n_samples
   image_shape: null            # e.g. [1, 64, 64]; null → inferred from model.config
@@ -112,7 +114,6 @@ generate:
   labels: null                 # discrete: list of int class labels (length 1 or n_samples)
   continuous_labels: null      # continuous: path to .npy of shape (n_samples, D) or (1, D)
   guidance_scale: null         # CFG guidance scale; null disables amplification
-  ddim_thinning: null          # set to e.g. 10 → 100 inference steps from 1000 (DDIM)
   ema_sigma_rel: null          # synthesize EMA at this target before sampling; null disables
   seed: null                   # set for reproducibility
   device: null                 # null → cuda if available else cpu

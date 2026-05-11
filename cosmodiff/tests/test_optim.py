@@ -225,11 +225,11 @@ def test_generate_ddpm():
     assert torch.isfinite(images).all()
 
 
-def test_generate_ddim_thinning():
-    """ddim_thinning reduces inference steps and output is still valid."""
+def test_generate_num_steps():
+    """num_steps reduces inference steps and output is still valid."""
     model = _make_unet()
     scheduler = DDIMScheduler(num_train_timesteps=10)
-    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), ddim_thinning=2)
+    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
 
     assert images.shape == (2, 1, 8, 8)
     assert torch.isfinite(images).all()
@@ -868,7 +868,8 @@ def test_sample_script():
                 "--n_samples", "4",
                 "--batch_size", "2",
                 "--image_shape", "1", "8", "8",
-                "--ddim_thinning", "2",  # 5 inference steps for speed
+                "--scheduler", "DDIMScheduler",
+                "--num_steps", "5",
                 "--device", "cpu",
                 "--output", out_npy,
                 "--seed", "0",
@@ -908,7 +909,8 @@ def test_sample_script_with_ema():
                 "--output_dir", tmp_dir,
                 "--n_samples", "2",
                 "--image_shape", "1", "8", "8",
-                "--ddim_thinning", "5",
+                "--scheduler", "DDIMScheduler",
+                "--num_steps", "2",
                 "--device", "cpu",
                 "--output", out_npy,
                 "--ema_sigma_rel", "0.05",

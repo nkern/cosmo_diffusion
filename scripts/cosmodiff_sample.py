@@ -5,6 +5,9 @@ Usage:
     python cosmodiff_sample.py --checkpoint path/to/checkpoint --n_samples 100 --output samples.npy
     python cosmodiff_sample.py --output_dir path/to/run --n_samples 64 --image_shape 1 64 64
 
+Fast sampling:
+    --scheduler DPMSolverMultistepScheduler --num_steps 25
+
 EMA:
     --ema_sigma_rel 0.05  → synthesize EMA at target sigma_rel (uses all checkpoints in output_dir)
 """
@@ -93,11 +96,20 @@ def main():
              "checkpoints in output_dir) before sampling.",
     )
     parser.add_argument(
-        "--ddim_thinning",
+        "--scheduler",
+        type=str,
+        default=None,
+        help="Name of a diffusers scheduler class to use at inference, e.g. "
+             "'DDIMScheduler', 'HeunDiscreteScheduler', 'DPMSolverMultistepScheduler'. "
+             "Defaults to the training scheduler. The new scheduler is built via "
+             ".from_config() to inherit the trained beta schedule and prediction_type.",
+    )
+    parser.add_argument(
+        "--num_steps",
         type=int,
         default=None,
-        help="Thinning factor to reduce inference steps (e.g. 10 → 100 steps from 1000). "
-             "Automatically switches to DDIMScheduler regardless of what was used during training.",
+        help="Number of inference steps. Defaults to the scheduler's "
+             "num_train_timesteps (full schedule).",
     )
     parser.add_argument(
         "--seed",
@@ -137,12 +149,13 @@ def main():
 
     model, noise_scheduler, _optimizer, _lr_scheduler, _augmentations = load_checkpoint(ckpt_path)
 
-    # --- swap to DDIM if thinning requested -----------------------------
-    if args.ddim_thinning is not None:
-        from diffusers import DDIMScheduler
-        noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
+    # --- swap to a different scheduler if requested ---------------------
+    if args.scheduler is not None:
+        import diffusers
+        sched_cls = getattr(diffusers, args.scheduler)
+        noise_scheduler = sched_cls.from_config(noise_scheduler.config)
         if args.verbose:
-            print("Switched to DDIMScheduler for fast sampling.")
+            print(f"Switched to {args.scheduler} for inference.")
 
     # --- device ---------------------------------------------------------
     if args.device is not None:
@@ -238,7 +251,7 @@ def main():
             labels=batch_labels,
             guidance_scale=args.guidance_scale,
             conditioning=args.conditioning,
-            ddim_thinning=args.ddim_thinning,
+            num_steps=args.num_steps,
             device=device,
             generator=generator,
         )
