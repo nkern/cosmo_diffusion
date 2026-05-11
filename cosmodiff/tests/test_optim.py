@@ -950,7 +950,7 @@ def test_train_script_multipath():
 
 
 def test_sample_script():
-    """cosmodiff_sample.py main() runs end-to-end and writes an .npy file."""
+    """cosmodiff_sample.py main() runs end-to-end and writes an .npz file."""
     import sys
     from scripts.cosmodiff_sample import main
 
@@ -966,29 +966,32 @@ def test_sample_script():
             mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
         )
 
-        out_npy = os.path.join(tmp_dir, "samples.npy")
+        out_npz = os.path.join(tmp_dir, "samples.npz")
         orig_argv = sys.argv
         try:
             sys.argv = [
                 "cosmodiff_sample.py",
-                "--output_dir", tmp_dir,
+                "--checkpoints_dir", tmp_dir,
                 "--n_samples", "4",
                 "--batch_size", "2",
                 "--image_shape", "1", "8", "8",
                 "--scheduler", "DDIMScheduler",
                 "--num_steps", "5",
                 "--device", "cpu",
-                "--output", out_npy,
+                "--filepath", out_npz,
                 "--seed", "0",
             ]
             main()
         finally:
             sys.argv = orig_argv
 
-        assert os.path.exists(out_npy), f"expected samples at {out_npy}"
-        arr = np.load(out_npy)
+        assert os.path.exists(out_npz), f"expected samples at {out_npz}"
+        data = np.load(out_npz, allow_pickle=True)
+        arr = data["samples"]
         assert arr.shape == (4, 1, 8, 8), f"unexpected shape {arr.shape}"
         assert np.isfinite(arr).all(), "non-finite values in generated samples"
+        assert "ckpt_path" in data.files
+        assert os.path.exists(str(data["ckpt_path"]))
 
 
 def test_sample_script_with_ema():
@@ -1008,18 +1011,18 @@ def test_sample_script_with_ema():
             ema_sigma_rels=(0.05, 0.28),
         )
 
-        out_npy = os.path.join(tmp_dir, "samples_ema.npy")
+        out_npz = os.path.join(tmp_dir, "samples_ema.npz")
         orig_argv = sys.argv
         try:
             sys.argv = [
                 "cosmodiff_sample.py",
-                "--output_dir", tmp_dir,
+                "--checkpoints_dir", tmp_dir,
                 "--n_samples", "2",
                 "--image_shape", "1", "8", "8",
                 "--scheduler", "DDIMScheduler",
                 "--num_steps", "2",
                 "--device", "cpu",
-                "--output", out_npy,
+                "--filepath", out_npz,
                 "--ema_sigma_rel", "0.05",
                 "--seed", "0",
             ]
@@ -1027,8 +1030,8 @@ def test_sample_script_with_ema():
         finally:
             sys.argv = orig_argv
 
-        assert os.path.exists(out_npy)
-        arr = np.load(out_npy)
+        assert os.path.exists(out_npz)
+        arr = np.load(out_npz, allow_pickle=True)["samples"]
         assert arr.shape == (2, 1, 8, 8)
         assert np.isfinite(arr).all()
 
@@ -1049,24 +1052,24 @@ def test_sample_script_flow_matching():
             mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
         )
 
-        out_npy = os.path.join(tmp_dir, "samples_fm.npy")
+        out_npz = os.path.join(tmp_dir, "samples_fm.npz")
         orig_argv = sys.argv
         try:
             sys.argv = [
                 "cosmodiff_sample.py",
-                "--output_dir", tmp_dir,
+                "--checkpoints_dir", tmp_dir,
                 "--n_samples", "2",
                 "--image_shape", "1", "8", "8",
                 "--num_steps", "5",
                 "--device", "cpu",
-                "--output", out_npy,
+                "--filepath", out_npz,
                 "--seed", "0",
             ]
             main()
         finally:
             sys.argv = orig_argv
 
-        assert os.path.exists(out_npy)
-        arr = np.load(out_npy)
+        assert os.path.exists(out_npz)
+        arr = np.load(out_npz, allow_pickle=True)["samples"]
         assert arr.shape == (2, 1, 8, 8)
         assert np.isfinite(arr).all()
