@@ -2,10 +2,25 @@ import os
 import tempfile
 import numpy as np
 import torch
-from diffusers import UNet2DModel, DDPMScheduler, DDIMScheduler, DiTTransformer2DModel
+from diffusers import (
+    UNet2DModel,
+    UNet2DConditionModel,
+    DDPMScheduler,
+    DDIMScheduler,
+    EulerDiscreteScheduler,
+    DiTTransformer2DModel,
+    PixArtTransformer2DModel,
+    FlowMatchEulerDiscreteScheduler,
+)
 from cosmodiff.utils import load_checkpoint, ArrayDataset, find_latest_checkpoint
-from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder
+from cosmodiff.optim import train, generate, compute_fid, compute_kid, build_pca_encoder, synthesize_ema_from_checkpoints, compute_ema_profiles, load_ema_snapshot
 from cosmodiff.augment import RandomRoll, RandomFlip
+from cosmodiff.data import DATA_PATH
+
+SIM_PATH = DATA_PATH / 'IllustrisTNG_Mcdm.npy'
+PARAMS_PATH = DATA_PATH / 'params_Illustris.txt'
+# shape: (34,) simulations × 6 cosmological parameters (a,b,c,d,e,f)
+N_SIMS, N_PARAMS = 34, 6
 
 
 def test_train_basic():
@@ -22,12 +37,12 @@ def test_train_basic():
     )
 
     images = torch.randn(16, 1, 8, 8)
-    augmentations = torch.nn.Sequential(RandomRoll(dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
+    augmentations = torch.nn.Sequential(RandomRoll(size=8, dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
     dataset = ArrayDataset(images, augmentations=augmentations)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         initial_weights = model.conv_in.weight.data.clone()
-        metrics = train(
+        result = train(
             dataset,
             model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
@@ -49,8 +64,8 @@ def test_train_basic():
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(model.conv_in.weight.data, initial_weights)
 
         # load_checkpoint
@@ -66,7 +81,7 @@ def test_train_basic():
 
         # continue training from checkpoint
         initial_weights = model.conv_in.weight.data.clone()
-        metrics = train(
+        result = train(
             dataset,
             resume_from_checkpoint=ckpt_path,
             num_epochs=2,
@@ -86,8 +101,8 @@ def test_train_basic():
         )
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(_model2.conv_in.weight.data, initial_weights)
 
 
@@ -107,12 +122,12 @@ def test_train_conditional_dit():
 
     images = torch.randn(16, 1, 4, 4)
     labels = torch.randint(0, 4, (16,))
-    augmentations = torch.nn.Sequential(RandomRoll(dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
+    augmentations = torch.nn.Sequential(RandomRoll(size=4, dims=(-1,-2)), RandomFlip(dims=(-1, -2)))
     dataset = ArrayDataset(images, labels=labels, augmentations=augmentations)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         initial_weights = model.transformer_blocks[0].ff.net[0].proj.weight.clone()
-        metrics = train(
+        result = train(
             dataset,
             model,
             noise_scheduler=DDPMScheduler(num_train_timesteps=10),
@@ -134,8 +149,8 @@ def test_train_conditional_dit():
         assert os.path.exists(os.path.join(ckpt_path, "metrics.json"))
 
         # training checks: finite output, and weights changed
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["loss"])
-        assert all(torch.isfinite(torch.tensor(v)) for v in metrics["epoch_loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["epoch_loss"])
         assert not torch.allclose(model.transformer_blocks[0].ff.net[0].proj.weight, initial_weights)
 
         # load_checkpoint
@@ -163,6 +178,52 @@ def _make_unet(sample_size=8):
     )
 
 
+def _make_unet_class_cond(n_classes=4, sample_size=8):
+    return UNet2DModel(
+        sample_size=sample_size,
+        in_channels=1,
+        out_channels=1,
+        layers_per_block=1,
+        block_out_channels=(16, 16),
+        down_block_types=("DownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "UpBlock2D"),
+        norm_num_groups=8,
+        num_class_embeds=n_classes + 1,  # last index is the null token
+    )
+
+
+def _make_unet_condition(sample_size=8, n_params=2):
+    return UNet2DConditionModel(
+        sample_size=sample_size,
+        in_channels=1,
+        out_channels=1,
+        layers_per_block=1,
+        block_out_channels=(16, 16),
+        down_block_types=("DownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "UpBlock2D"),
+        norm_num_groups=8,
+        cross_attention_dim=16,
+        encoder_hid_dim=n_params,
+        encoder_hid_dim_type="text_proj",
+    )
+
+
+def _make_pixart(sample_size=8, n_params=N_PARAMS):
+    return PixArtTransformer2DModel(
+        sample_size=sample_size,
+        patch_size=2,
+        in_channels=1,
+        out_channels=1,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        cross_attention_dim=16,
+        caption_channels=n_params,
+        use_additional_conditions=False,
+        norm_num_groups=None,
+    )
+
+
 def test_generate_ddpm():
     """generate() returns the right shape and finite values with DDPMScheduler."""
     model = _make_unet()
@@ -173,11 +234,11 @@ def test_generate_ddpm():
     assert torch.isfinite(images).all()
 
 
-def test_generate_ddim_thinning():
-    """ddim_thinning reduces inference steps and output is still valid."""
+def test_generate_num_steps():
+    """num_steps reduces inference steps and output is still valid."""
     model = _make_unet()
     scheduler = DDIMScheduler(num_train_timesteps=10)
-    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), ddim_thinning=2)
+    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
 
     assert images.shape == (2, 1, 8, 8)
     assert torch.isfinite(images).all()
@@ -302,4 +363,710 @@ def test_kid_smaller_same_dist():
     assert kid_same < kid_diff
 
 
+# ------------------------------------------------------------------ #
+# CFG / conditioning tests                                             #
+# ------------------------------------------------------------------ #
 
+def test_train_cfg_class_labels():
+    """train() with cfg_dropout runs without error and produces finite loss."""
+    n_classes = 4
+    model = _make_unet_class_cond(n_classes=n_classes)
+    images = torch.randn(8, 1, 8, 8)
+    labels = torch.randint(0, n_classes, (8,))
+    dataset = ArrayDataset(images, labels=labels)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            cfg_dropout=0.5,
+            conditioning='discrete',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+
+
+def test_train_encoder_hidden_states():
+    """train() with conditioning='continuous' using real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    images = torch.randn(len(params), 1, 8, 8)
+    labels = torch.as_tensor(params)  # (34, 6)
+    dataset = ArrayDataset(images, labels=labels)
+    model = _make_unet_condition(n_params=N_PARAMS)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            conditioning='continuous',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+
+
+def test_generate_encoder_hidden_states():
+    """generate() with conditioning='continuous' using real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    model = _make_unet_condition(n_params=N_PARAMS)
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    # use first 3 simulations' parameters as conditioning
+    labels = torch.as_tensor(params[:3])  # (3, 6)
+
+    images = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels,
+        conditioning='continuous',
+    )
+    assert images.shape == (3, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_cfg_guidance_scale():
+    """guidance_scale != 1.0 produces different output than guidance_scale=1.0."""
+    n_classes = 4
+    model = _make_unet_class_cond(n_classes=n_classes)
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    labels = torch.tensor([0, 1, 2])
+
+    g1 = torch.Generator().manual_seed(0)
+    out_no_cfg = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels, guidance_scale=None,
+        conditioning='discrete',
+        generator=g1,
+    )
+
+    g2 = torch.Generator().manual_seed(0)
+    out_cfg = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels, guidance_scale=2.0,
+        conditioning='discrete',
+        generator=g2,
+    )
+
+    assert out_no_cfg.shape == out_cfg.shape == (3, 1, 8, 8)
+    assert torch.isfinite(out_cfg).all()
+    assert not torch.allclose(out_no_cfg, out_cfg)
+
+
+def test_train_pixart():
+    """train() with PixArtTransformer2DModel and real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)  # (34, 6)
+    images = torch.randn(len(params), 1, 8, 8)
+    labels = torch.as_tensor(params)
+    dataset = ArrayDataset(images, labels=labels)
+    model = _make_pixart()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            conditioning='continuous',
+        )
+    assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+
+
+def test_generate_pixart():
+    """generate() with PixArtTransformer2DModel and real cosmological params."""
+    params = np.loadtxt(PARAMS_PATH, dtype=np.float32)
+    model = _make_pixart()
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    labels = torch.as_tensor(params[:3])  # (3, 6)
+
+    images = generate(
+        model, scheduler,
+        batch_size=3, image_shape=(1, 8, 8),
+        labels=labels,
+        conditioning='continuous',
+    )
+    assert images.shape == (3, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+# ------------------------------------------------------------------ #
+# EMA tests                                                            #
+# ------------------------------------------------------------------ #
+
+def test_train_ema():
+    """train() with ema_sigma_rels checkpoints EMA profiles and returns ema object."""
+    model = _make_unet()
+    images = torch.randn(8, 1, 8, 8)
+    dataset = ArrayDataset(images)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2,
+            batch_size=4,
+            checkpoint_every_n_epochs=2,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+        )
+
+        assert result['ema'] is not None
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']["loss"])
+
+        # EMA profiles should be checkpointed inside the epoch checkpoint dir
+        ckpt_path = os.path.join(tmp_dir, "checkpoint-epoch-0001")
+        assert os.path.isdir(os.path.join(ckpt_path, 'ema'))
+
+        # should be able to synthesize a new EMA profile post-hoc
+        synthesized = result['ema'].synthesize_ema_model(sigma_rel=0.15)
+        assert synthesized is not None
+
+
+def test_train_ema_multi_checkpoint_synthesis():
+    """Multi-checkpoint pooling reduces synthesis residual and produces distinct models.
+
+    Tests two properties from Karras et al. 2024:
+    1. More checkpoints → smaller ||w_synth - w_target|| (better approximation).
+    2. Different sigma_rel targets → different synthesized model weights.
+    """
+    import glob
+
+    sigma_rels_train = (0.05, 0.28)
+    sigma_rel_target = 0.15
+    num_epochs = 9
+    checkpoint_every = 3
+    checkpoint_epochs = list(range(checkpoint_every - 1, num_epochs, checkpoint_every))
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=num_epochs,
+            batch_size=4,
+            checkpoint_every_n_epochs=checkpoint_every,
+            mixed_precision="no",
+            output_dir=tmp_dir,
+            force_cpu=True,
+            verbose=False,
+            ema_sigma_rels=sigma_rels_train,
+        )
+
+        assert len(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*'))) == 3
+
+        # 1. more checkpoints → smaller synthesis residual
+        profiles_one = compute_ema_profiles(
+            sigma_rels_train, checkpoint_epochs[:1], num_epochs, sigma_rel_target
+        )
+        profiles_all = compute_ema_profiles(
+            sigma_rels_train, checkpoint_epochs, num_epochs, sigma_rel_target
+        )
+        residual_one = np.sum((profiles_one['synthesized'] - profiles_one['target']) ** 2)
+        residual_all = np.sum((profiles_all['synthesized'] - profiles_all['target']) ** 2)
+        assert residual_all < residual_one, \
+            f"expected residual to decrease with more checkpoints: {residual_one:.6f} → {residual_all:.6f}"
+
+        # 2. different sigma_rel targets → different synthesized model weights
+        synth_lo = synthesize_ema_from_checkpoints(model, tmp_dir, sigma_rel_target=0.05)
+        synth_hi = synthesize_ema_from_checkpoints(model, tmp_dir, sigma_rel_target=0.28)
+        params_lo = torch.cat([p.flatten() for p in synth_lo.parameters()])
+        params_hi = torch.cat([p.flatten() for p in synth_hi.parameters()])
+        assert not torch.equal(params_lo, params_hi), \
+            "sigma_rel=0.05 and sigma_rel=0.28 produced identical model weights"
+
+
+def test_load_ema_snapshot():
+    """load_ema_snapshot loads raw profile weights from a single checkpoint."""
+    import glob
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+        )
+
+        ckpt_dirs = sorted(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*')))
+        assert len(ckpt_dirs) == 2
+        latest_ckpt = ckpt_dirs[-1]
+
+        # different profiles should produce different weights
+        m0 = load_ema_snapshot(_make_unet(), latest_ckpt, profile_index=0)
+        m1 = load_ema_snapshot(_make_unet(), latest_ckpt, profile_index=1)
+        p0 = torch.cat([p.flatten() for p in m0.parameters()])
+        p1 = torch.cat([p.flatten() for p in m1.parameters()])
+        assert not torch.equal(p0, p1), "profile 0 and 1 snapshots are identical"
+        assert all(torch.isfinite(p).all() for p in m0.parameters())
+
+
+def test_train_ema_burn_in():
+    """EMA burn-in delays update() until global_step >= ema_burn_in.
+
+    With burn_in larger than total steps, no EMA updates fire and no .pt files
+    should be written. With burn_in less than total steps, snapshots exist and
+    their internal step counter equals total_steps - burn_in.
+    """
+    import glob
+
+    # case 1: burn_in exceeds total training steps → no snapshots
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 2 epochs × 2 batches/epoch = 4 total steps, burn_in=10 skips them all
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+            ema_burn_in=10,
+        )
+        pt_files = glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*/ema/*.pt'))
+        assert len(pt_files) == 0, f"expected no EMA snapshots when burn_in>total, got {pt_files}"
+
+    # case 2: burn_in skips a few steps; snapshots present and stamped with t_eff
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 4 epochs × 2 batches/epoch = 8 total steps, burn_in=3 → 5 EMA updates
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+            ema_burn_in=3,
+        )
+        pt_files = sorted(glob.glob(os.path.join(tmp_dir, 'checkpoint-epoch-*/ema/*.pt')))
+        assert len(pt_files) == 2, f"expected 2 EMA snapshots, got {pt_files}"
+        # filename format: {profile_index}.{ema_internal_step}.pt
+        # ema_internal_step at the final checkpoint should be total_steps - burn_in = 8 - 3 = 5
+        for f in pt_files:
+            stem = os.path.basename(f).replace('.pt', '')
+            _, step_str = stem.split('.')
+            assert int(step_str) == 5, f"expected internal step 5, got {step_str} from {f}"
+
+
+def test_train_sigma_log_normal_sampling():
+    """train() with sigma_log_normal samples timesteps and produces finite losses."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10, prediction_type='v_prediction'),
+            num_epochs=2, batch_size=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            sigma_log_normal=(-1.2, 1.2),
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+
+
+def test_train_min_snr_weighting():
+    """train() with min_snr_gamma set runs and produces finite losses for all 3 prediction types."""
+    for prediction_type in ('epsilon', 'v_prediction', 'sample'):
+        model = _make_unet()
+        dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = train(
+                dataset, model,
+                noise_scheduler=DDPMScheduler(num_train_timesteps=10, prediction_type=prediction_type),
+                num_epochs=2, batch_size=4,
+                mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+                min_snr_gamma=5.0,
+            )
+            assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss']), \
+                f"non-finite loss with min_snr_gamma + prediction_type={prediction_type}"
+
+
+def test_train_flow_matching_basic():
+    """train() with FlowMatchEulerDiscreteScheduler runs the FM noising/target
+    path and produces finite losses with weights that have moved."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(16, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        initial_weight = model.conv_in.weight.data.clone()
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['epoch_loss'])
+        assert not torch.allclose(model.conv_in.weight.data, initial_weight)
+
+
+def test_train_flow_matching_min_snr_is_noop():
+    """min_snr_gamma is a DDPM-only weighting; setting it for FM must not error."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            min_snr_gamma=5.0,  # should be silently ignored for FM
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+
+
+def test_train_flow_matching_sigma_log_normal():
+    """sigma_log_normal is interpreted as logit-normal t parameters under FM."""
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            sigma_log_normal=(0.0, 1.0),
+        )
+        assert all(torch.isfinite(torch.tensor(v)) for v in result['metrics']['loss'])
+
+
+def test_generate_flow_matching():
+    """generate() works with a FlowMatchEulerDiscreteScheduler-trained model."""
+    model = _make_unet()
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_euler():
+    """s_churn is forwarded to EulerDiscreteScheduler.step and produces finite output."""
+    model = _make_unet()
+    scheduler = EulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8), num_steps=5,
+        s_churn=10.0, s_tmin=0.0, s_tmax=float('inf'), s_noise=1.0,
+    )
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_flow_match():
+    """s_churn is also accepted by FlowMatchEulerDiscreteScheduler."""
+    model = _make_unet()
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=10)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8), num_steps=5,
+        s_churn=5.0,
+    )
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_s_churn_silently_dropped_for_ddpm():
+    """s_churn is silently dropped for schedulers that don't accept it (no error)."""
+    model = _make_unet()
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    # DDPMScheduler.step doesn't accept s_churn; this should not raise.
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8),
+        s_churn=10.0, s_noise=2.0,
+    )
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_train_script():
+    """cosmodiff_train.py main() runs end-to-end and writes a metrics file."""
+    import sys
+    import yaml
+    from scripts.cosmodiff_train import main
+
+    minimal_config = {
+        "global": {"device": "cpu", "dtype": "float32"},
+        "io": {"output_dir": None},  # filled in below
+        "data": {
+            "img_path": str(SIM_PATH),
+            "img_read_fn": "npy_read_fn",
+            "reshape": "2d",
+            "zthin": 4,
+            "n_samples": 8,
+            "keep_on_cpu": True,
+            "normalization": "center-max",
+            "norm_kwargs": {"center": None, "xmax": None, "alpha": None, "beta": None},
+        },
+        "augmentations": {},
+        "model": {
+            "class": "UNet2DModel",
+            "kwargs": {
+                "sample_size": 8,
+                "in_channels": 1,
+                "out_channels": 1,
+                "layers_per_block": 1,
+                "block_out_channels": [16, 16],
+                "down_block_types": ["DownBlock2D", "DownBlock2D"],
+                "up_block_types": ["UpBlock2D", "UpBlock2D"],
+                "norm_num_groups": 8,
+            },
+        },
+        "noise_scheduler": {
+            "class": "DDPMScheduler",
+            "kwargs": {"num_train_timesteps": 10},
+        },
+        "optimizer": {"class": "AdamW", "kwargs": {"lr": 1e-4}},
+        "lr_scheduler": {"class": "ConstantLR", "kwargs": {"factor": 1.0, "total_iters": 0}},
+        "train": {
+            "num_epochs": 2,
+            "batch_size": 4,
+            "mixed_precision": "no",
+            "checkpoint_every_n_epochs": 2,
+            "force_cpu": True,
+            "verbose": False,
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        minimal_config["io"]["output_dir"] = tmp_dir
+        config_path = os.path.join(tmp_dir, "config.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(minimal_config, f)
+
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["cosmodiff_train.py", "--config", config_path]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        metrics_files = [
+            f for f in os.listdir(tmp_dir) if f.startswith("metrics_epoch_")
+        ]
+        assert len(metrics_files) == 1, f"expected 1 metrics file, got {metrics_files}"
+
+
+def test_train_script_multipath():
+    """cosmodiff_train.py main() runs end-to-end on a multi-path config.
+    """
+    import sys
+    import yaml
+    from scripts.cosmodiff_train import main
+
+    multipath_cfg_path = DATA_PATH / 'config_multipath.yaml'
+    with open(multipath_cfg_path) as f:
+        config = yaml.safe_load(f)
+
+    # --- override data paths and read fns for the bundled test data ---
+    config["data"]["img_path"] = [str(SIM_PATH), str(SIM_PATH)]
+    config["data"]["label_path"] = [str(PARAMS_PATH), str(PARAMS_PATH)]
+    config["data"]["img_read_fn"] = "npy_read_fn"
+    config["data"]["label_read_fn"] = "txt_read_fn"
+    # the shipped config still uses the legacy 'two_dim' key — replace it
+    config["data"].pop("two_dim", None)
+    config["data"]["reshape"] = "2d"
+    config["data"]["zthin"] = 4
+    config["data"]["normalization"] = "min-max"
+    config["data"]["transform"] = None  # log on cosmology data is fine but unrelated to this test
+    config["data"]["keep_on_cpu"] = True
+
+    # --- shrink model to test scale ---
+    config["model"] = {
+        "class": "UNet2DConditionModel",
+        "kwargs": {
+            "sample_size": 64,
+            "in_channels": 1,
+            "out_channels": 1,
+            "layers_per_block": 1,
+            "block_out_channels": [16, 16],
+            "down_block_types": ["DownBlock2D", "DownBlock2D"],
+            "up_block_types": ["UpBlock2D", "UpBlock2D"],
+            "norm_num_groups": 8,
+            "cross_attention_dim": 16,
+            "encoder_hid_dim": N_PARAMS,
+        },
+    }
+    config["noise_scheduler"] = {
+        "class": "DDPMScheduler",
+        "kwargs": {"num_train_timesteps": 10},
+    }
+    config["augmentations"] = {}
+
+    # --- shrink training schedule ---
+    config["train"].update({
+        "num_epochs": 2,
+        "batch_size": 4,
+        "mixed_precision": "no",
+        "checkpoint_every_n_epochs": 2,
+        "force_cpu": True,
+        "verbose": False,
+        "conditioning": "continuous",  # cosmology params are 6-D float vectors
+        "ema_sigma_rels": None,
+        "ema_burn_in": 0,
+        "dataloader_num_workers": 0,
+    })
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config["io"]["output_dir"] = tmp_dir
+        config_path = os.path.join(tmp_dir, "config_multipath.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(config, f)
+
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["cosmodiff_train.py", "--config", config_path]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        metrics_files = [
+            f for f in os.listdir(tmp_dir) if f.startswith("metrics_epoch_")
+        ]
+        assert len(metrics_files) == 1, f"expected 1 metrics file, got {metrics_files}"
+
+
+def test_sample_script():
+    """cosmodiff_sample.py main() runs end-to-end and writes an .npy file."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    # First train a tiny model so we have a real checkpoint on disk.
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "4",
+                "--batch_size", "2",
+                "--image_shape", "1", "8", "8",
+                "--scheduler", "DDIMScheduler",
+                "--num_steps", "5",
+                "--device", "cpu",
+                "--output", out_npy,
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy), f"expected samples at {out_npy}"
+        arr = np.load(out_npy)
+        assert arr.shape == (4, 1, 8, 8), f"unexpected shape {arr.shape}"
+        assert np.isfinite(arr).all(), "non-finite values in generated samples"
+
+
+def test_sample_script_with_ema():
+    """cosmodiff_sample.py with --ema_sigma_rel synthesizes EMA before sampling."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=DDPMScheduler(num_train_timesteps=10),
+            num_epochs=4, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+            ema_sigma_rels=(0.05, 0.28),
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples_ema.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "2",
+                "--image_shape", "1", "8", "8",
+                "--scheduler", "DDIMScheduler",
+                "--num_steps", "2",
+                "--device", "cpu",
+                "--output", out_npy,
+                "--ema_sigma_rel", "0.05",
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy)
+        arr = np.load(out_npy)
+        assert arr.shape == (2, 1, 8, 8)
+        assert np.isfinite(arr).all()
+
+
+def test_sample_script_flow_matching():
+    """cosmodiff_sample.py runs end-to-end against a FM-trained checkpoint."""
+    import sys
+    from scripts.cosmodiff_sample import main
+
+    model = _make_unet()
+    dataset = ArrayDataset(torch.randn(8, 1, 8, 8))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        train(
+            dataset, model,
+            noise_scheduler=FlowMatchEulerDiscreteScheduler(num_train_timesteps=10),
+            num_epochs=2, batch_size=4, checkpoint_every_n_epochs=2,
+            mixed_precision="no", output_dir=tmp_dir, force_cpu=True, verbose=False,
+        )
+
+        out_npy = os.path.join(tmp_dir, "samples_fm.npy")
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "cosmodiff_sample.py",
+                "--output_dir", tmp_dir,
+                "--n_samples", "2",
+                "--image_shape", "1", "8", "8",
+                "--num_steps", "5",
+                "--device", "cpu",
+                "--output", out_npy,
+                "--seed", "0",
+            ]
+            main()
+        finally:
+            sys.argv = orig_argv
+
+        assert os.path.exists(out_npy)
+        arr = np.load(out_npy)
+        assert arr.shape == (2, 1, 8, 8)
+        assert np.isfinite(arr).all()

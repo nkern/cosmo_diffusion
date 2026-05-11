@@ -4,6 +4,15 @@
 Usage:
     python cosmodiff_sample.py --checkpoint path/to/checkpoint --n_samples 100 --output samples.npy
     python cosmodiff_sample.py --output_dir path/to/run --n_samples 64 --image_shape 1 64 64
+
+Fast sampling (diffusion-trained models):
+    --scheduler DPMSolverMultistepScheduler --num_steps 25
+
+Fast sampling (flow-matching-trained models):
+    --scheduler FlowMatchHeunDiscreteScheduler --num_steps 25
+
+EMA:
+    --ema_sigma_rel 0.05  → synthesize EMA at target sigma_rel (uses all checkpoints in output_dir)
 """
 
 import argparse
@@ -56,15 +65,81 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Class labels for conditional generation. Must be length 1 "
-             "(broadcast to all samples) or n_samples.",
+        help="Discrete class labels for conditional generation. Must be length 1 "
+             "(broadcast to all samples) or n_samples. Use --continuous_labels for "
+             "encoder_hidden_states-style conditioning.",
     )
     parser.add_argument(
-        "--ddim_thinning",
+        "--continuous_labels",
+        type=str,
+        default=None,
+        help="Path to a .npy file of float conditioning vectors of shape "
+             "(n_samples, D) or (1, D) (broadcast). Used with --conditioning continuous.",
+    )
+    parser.add_argument(
+        "--conditioning",
+        type=str,
+        choices=["discrete", "continuous"],
+        default="discrete",
+        help="Conditioning mode used during training. Defaults to 'discrete'.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale at inference. None (default) disables "
+             "CFG amplification. Typical values 1.0-7.0.",
+    )
+    parser.add_argument(
+        "--ema_sigma_rel",
+        type=float,
+        default=None,
+        help="Target sigma_rel for post-hoc EMA weight synthesis. When set, the "
+             "model weights are replaced by the synthesized EMA (across all "
+             "checkpoints in output_dir) before sampling.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default=None,
+        help="Name of a diffusers scheduler class to use at inference, e.g. "
+             "'DDIMScheduler', 'HeunDiscreteScheduler', 'DPMSolverMultistepScheduler'. "
+             "Defaults to the training scheduler. The new scheduler is built via "
+             ".from_config() to inherit the trained beta schedule and prediction_type.",
+    )
+    parser.add_argument(
+        "--num_steps",
         type=int,
         default=None,
-        help="Thinning factor to reduce inference steps (e.g. 10 → 100 steps from 1000). "
-             "Automatically switches to DDIMScheduler regardless of what was used during training.",
+        help="Number of inference steps. Defaults to the scheduler's "
+             "num_train_timesteps (full schedule).",
+    )
+    parser.add_argument(
+        "--s_churn",
+        type=float,
+        default=None,
+        help="EDM-style stochasticity injection (Karras et al. 2022). "
+             "0 = pure ODE; larger = more SDE-like. Only consumed by "
+             "Euler/Heun-family schedulers (diffusion or FM); silently "
+             "ignored for others (DDPM, DDIM, DPM-Solver, etc.).",
+    )
+    parser.add_argument(
+        "--s_tmin",
+        type=float,
+        default=None,
+        help="Lower-bound timestep for churn gating; ignored when --s_churn is unset.",
+    )
+    parser.add_argument(
+        "--s_tmax",
+        type=float,
+        default=None,
+        help="Upper-bound timestep for churn gating; ignored when --s_churn is unset.",
+    )
+    parser.add_argument(
+        "--s_noise",
+        type=float,
+        default=None,
+        help="Multiplier on injected noise magnitude during churn (default 1.0).",
     )
     parser.add_argument(
         "--seed",
@@ -87,27 +162,30 @@ def main():
     args = parser.parse_args()
 
     from cosmodiff.utils import load_checkpoint, find_latest_checkpoint
-    from cosmodiff.optim import generate
+    from cosmodiff.optim import generate, synthesize_ema_from_checkpoints
 
     # --- resolve checkpoint ---------------------------------------------
     if args.checkpoint is not None:
         ckpt_path = args.checkpoint
+        output_dir = os.path.dirname(os.path.abspath(ckpt_path))
     else:
-        ckpt_path = find_latest_checkpoint(args.output_dir)
+        output_dir = args.output_dir
+        ckpt_path = find_latest_checkpoint(output_dir)
         if ckpt_path is None:
-            raise FileNotFoundError(f"No checkpoints found in {args.output_dir}")
+            raise FileNotFoundError(f"No checkpoints found in {output_dir}")
 
     if args.verbose:
         print(f"Loading checkpoint: {ckpt_path}")
 
     model, noise_scheduler, _optimizer, _lr_scheduler, _augmentations = load_checkpoint(ckpt_path)
 
-    # --- swap to DDIM if thinning requested -----------------------------
-    if args.ddim_thinning is not None:
-        from diffusers import DDIMScheduler
-        noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
+    # --- swap to a different scheduler if requested ---------------------
+    if args.scheduler is not None:
+        import diffusers
+        sched_cls = getattr(diffusers, args.scheduler)
+        noise_scheduler = sched_cls.from_config(noise_scheduler.config)
         if args.verbose:
-            print("Switched to DDIMScheduler for fast sampling.")
+            print(f"Switched to {args.scheduler} for inference.")
 
     # --- device ---------------------------------------------------------
     if args.device is not None:
@@ -120,6 +198,16 @@ def main():
     model = model.to(device)
     if args.verbose:
         print(f"Using device: {device}")
+
+    # --- EMA synthesis (overrides model weights) ------------------------
+    if args.ema_sigma_rel is not None:
+        if args.verbose:
+            print(f"Synthesizing EMA weights at sigma_rel={args.ema_sigma_rel} from {output_dir}")
+        model = synthesize_ema_from_checkpoints(
+            model, output_dir, sigma_rel_target=args.ema_sigma_rel,
+        )
+        model = model.to(device)
+        model.eval()
 
     # --- image shape ----------------------------------------------------
     if args.image_shape is not None:
@@ -138,16 +226,35 @@ def main():
 
     # --- labels ---------------------------------------------------------
     labels_tensor = None
-    if args.labels is not None:
-        if len(args.labels) == 1:
-            labels_tensor = torch.full((args.n_samples,), args.labels[0], dtype=torch.long)
-        elif len(args.labels) == args.n_samples:
-            labels_tensor = torch.tensor(args.labels, dtype=torch.long)
-        else:
+    if args.conditioning == "discrete":
+        if args.labels is not None:
+            if len(args.labels) == 1:
+                labels_tensor = torch.full((args.n_samples,), args.labels[0], dtype=torch.long)
+            elif len(args.labels) == args.n_samples:
+                labels_tensor = torch.tensor(args.labels, dtype=torch.long)
+            else:
+                raise ValueError(
+                    f"--labels must be length 1 or n_samples ({args.n_samples}), "
+                    f"got {len(args.labels)}."
+                )
+    else:  # continuous
+        if args.continuous_labels is None:
             raise ValueError(
-                f"--labels must be length 1 or n_samples ({args.n_samples}), "
-                f"got {len(args.labels)}."
+                "--continuous_labels is required when --conditioning continuous."
             )
+        cont_arr = np.load(args.continuous_labels)
+        if cont_arr.ndim != 2:
+            raise ValueError(
+                f"--continuous_labels must be 2D (N, D); got shape {cont_arr.shape}."
+            )
+        if cont_arr.shape[0] == 1:
+            cont_arr = np.broadcast_to(cont_arr, (args.n_samples, cont_arr.shape[1]))
+        elif cont_arr.shape[0] != args.n_samples:
+            raise ValueError(
+                f"--continuous_labels first dim must be 1 or n_samples ({args.n_samples}), "
+                f"got {cont_arr.shape[0]}."
+            )
+        labels_tensor = torch.as_tensor(np.asarray(cont_arr), dtype=torch.float32)
 
     # --- generator ------------------------------------------------------
     generator = None
@@ -172,7 +279,13 @@ def main():
             batch_size=bs,
             image_shape=image_shape,
             labels=batch_labels,
-            ddim_thinning=args.ddim_thinning,
+            guidance_scale=args.guidance_scale,
+            conditioning=args.conditioning,
+            num_steps=args.num_steps,
+            s_churn=args.s_churn,
+            s_tmin=args.s_tmin,
+            s_tmax=args.s_tmax,
+            s_noise=args.s_noise,
             device=device,
             generator=generator,
         )
@@ -184,7 +297,9 @@ def main():
 
     result = np.concatenate(all_samples, axis=0)
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     np.save(args.output, result)
     print(f"Saved {result.shape} array to {args.output}")
 

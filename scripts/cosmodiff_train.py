@@ -75,37 +75,39 @@ def main():
 
     # --- check for existing checkpoint ----------------------------------
     latest_ckpt = find_latest_checkpoint(output_dir)
-    dataset = parse_config_data(config)
+    data_out = parse_config_data(config)
+    dataset = data_out["data"]
 
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
-        metrics = train(
+        result = train(
             dataset,
             resume_from_checkpoint=latest_ckpt,
             output_dir=output_dir,
             **config["train"],
         )
+
     else:
         print("No checkpoint found, training from scratch.")
-        model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
-        metrics = train(
+        model_out = parse_config_model(config)
+        result = train(
             dataset,
-            model,
-            optimizer=optimizer,
-            noise_scheduler=noise_scheduler,
-            lr_scheduler=lr_scheduler,
+            model_out["model"],
+            optimizer=model_out["optimizer"],
+            noise_scheduler=model_out["noise_scheduler"],
+            lr_scheduler=model_out["lr_scheduler"],
             output_dir=output_dir,
             **config["train"],
         )
 
     print(f"Training complete.")
-    print(f"Final epoch loss: {metrics['epoch_loss'][-1]:.4f}")
-    print(f"Total time: {sum(metrics['epoch_times']):.1f}s")
+    print(f"Final epoch loss: {result['metrics']['epoch_loss'][-1]:.4f}")
+    print(f"Total time: {sum(result['metrics']['epoch_times']):.1f}s")
 
     metrics_path = os.path.join(
-        output_dir, "metrics_epoch_{:04d}.json".format(len(metrics["epoch_loss"]) - 1)
+        output_dir, "metrics_epoch_{:04d}.json".format(len(result['metrics']["epoch_loss"]) - 1)
     )
-    write_metrics(metrics, metrics_path)
+    write_metrics(result['metrics'], metrics_path)
     print(f"Metrics written to {metrics_path}")
 
 if __name__ == "__main__":

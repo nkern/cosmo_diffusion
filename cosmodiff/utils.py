@@ -14,7 +14,9 @@ from diffusers import AutoModel, DDPMScheduler
 from tqdm.auto import tqdm
 import time
 import yaml
-from typing import Optional
+from typing import Optional, Callable
+
+from .transform import Normalization, MultiNormalization, Transform, MultiTransform
 
 
 class ArrayDataset(Dataset):
@@ -41,11 +43,12 @@ class ArrayDataset(Dataset):
             dataset = ArrayDataset(images, labels=labels)
             # {"images": tensor, "labels": tensor}
     """
-    def __init__(self, arrays: torch.Tensor, labels: torch.Tensor = None, augmentations: callable = None):
-        # CUDA tensors cannot be shared across DataLoader worker processes (fork
-        # cannot inherit the CUDA context). Move to CPU; the training loop
-        # (via accelerate) handles GPU placement per-batch.
-        self.arrays = arrays.cpu()
+    def __init__(self,
+        arrays: torch.Tensor,
+        labels: torch.Tensor = None,
+        augmentations: callable = None,
+    ):
+        self.arrays = arrays
         self.labels = labels
         self.augmentations = augmentations
 
@@ -62,18 +65,20 @@ class ArrayDataset(Dataset):
 
 
 def load_data(
-    img_path: str | np.ndarray,
-    img_read_fn: callable,
+    img_path: str | np.ndarray | list[str],
+    img_read_fn: Callable | list[Callable],
     device: str | None = None,
     dtype: torch.dtype | None = None,
-    label_path: str | np.ndarray | None = None,
-    label_read_fn: Optional[callable] = None,
-    log: bool = False,
-    norm: str | None = None,
-    two_dim: bool = True,
-    zthin: int = 1,
-    n_samples: int | None = None,
+    label_path: str | np.ndarray | list[str] | None = None,
+    label_read_fn: Optional[Callable | list[Callable]] = None,
+    reshape: str | None = '2d',
+    zthin: int | list[int] = 1,
+    n_samples: int | list[int] | None = None,
     seed: np.random.Generator | None = None,
+    normalization: str | list[str] | None = None,
+    norm_kwargs: dict | list[dict] | None = None,
+    transform: list[str] | list[list[str]] | None = None,
+    read_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Load images and optionally labels into tensors ready for ``ArrayDataset``.
 
@@ -82,14 +87,6 @@ def load_data(
     where data is already in memory.
 
     Input arrays are assumed to be of shape ``(Nbatch, Nz, Nx, Ny)``.
-
-    If ``two_dim=True``, the z axis is optionally thinned by ``zthin`` and
-    the array is reshaped to ``(Nbatch * Nz, 1, Nx, Ny)``, treating each
-    z-slice as an independent 2D image.
-
-    If ``two_dim=False``, ``zthin`` is ignored and the array is unsqueezed
-    to ``(Nbatch, 1, Nz, Nx, Ny)`` treating each sample as a 3D volume
-    with a single channel.
 
     Args:
         img_path (str or np.ndarray): Path to the image data file on disk, or
@@ -107,21 +104,30 @@ def load_data(
         label_read_fn (callable, optional): User-provided function that accepts
             ``label_path`` and returns a numpy array of shape ``(N,)``. Ignored
             if ``label_path`` is already a numpy array. Defaults to ``None``.
-        log (bool): Apply a log transform to images before normalization.
-            Defaults to ``False``.
-        norm (str): Normalize images via "min-max" scaling ``[-1, 1]``,
-            or "center-scale".
-        two_dim (bool): If ``True``, reshape the data to treat each z-slice
-            as an independent 2D image. If ``False``, treat each sample as a
-            3D volume. Defaults to ``True``.
+        reshape (str): If '2d' (default), treat each z-slice as independent 2D image
+            and reshape to (batch, channel, H, W). If '3d', reshape to
+            (batch, channel, D, H, W). If None, don't reshape.
         zthin (int): Thinning factor along the z axis, applied before
-            reshaping when ``two_dim=True``. A value of ``1`` applies no
+            reshaping when ``reshape='2d'``. A value of ``1`` applies no
             thinning. Defaults to ``1``.
+        normalization (str): Normalize image pixel distribution.
+            ['min-max', 'center-max']
+        norm_kwargs: kwargs for pixel normalization function
+        transform (list): list of data transforms e.g. ['log', 'fft2'].
+            Ordered by operation. Note that 'log' always happens first if included.
+        read_only (bool): if True, only read the data from disk
+            to numpy array and return (no transform or normalization)
 
     Returns:
-        tuple: ``(images, labels)`` where ``images`` is a ``torch.Tensor`` on
-        ``device``, and ``labels`` is a LongTensor of shape ``(N,)`` or
-        ``None`` if ``label_path`` was not provided.
+        dict: A dictionary with keys
+
+            * ``'images'`` — ``torch.Tensor`` on ``device``.
+            * ``'labels'`` — ``LongTensor`` of shape ``(N,)``, or ``None`` if
+              ``label_path`` was not provided.
+            * ``'norm'`` — fitted :class:`Normalization` instance, or ``None``
+              if ``normalization`` was not requested.
+            * ``'tform'`` — fitted :class:`Transform` instance, or ``None`` if
+              ``transform`` was not requested.
 
     Example::
 
@@ -130,71 +136,246 @@ def load_data(
         def read_images(path):
             return np.load(path)
 
-        images, labels = load_data(
+        out = load_data(
             img_path="images.npy",
             img_read_fn=read_images,
             device="cpu",
             dtype=torch.float32,
-            two_dim=True,
+            reshape='2d',
             zthin=4,
         )
+        images, labels = out['images'], out['labels']
     """
-    # --- images ---------------------------------------------------------
-    if isinstance(img_path, np.ndarray):
-        images = img_path
-    else:
-        images = img_read_fn(img_path)
+    # first check if feeding lists of filepaths
+    if isinstance(img_path, (list, tuple)):
 
-    if n_samples is not None:
-        if seed is None:
-            idx = slice(n_samples)
-        else:
-            rng = np.random.default_rng(seed)
-            idx = rng.choice(len(images), size=n_samples, replace=False)
-        images = images[idx]
-    else:
-        # images may be a memory-mapped array, so slice to instantiate it
-        images = images[:]
+        # list of filepaths: assumes label_path is also list if provided
+        n = len(img_path)
+        if label_path is None:
+            label_path = [label_path] * n
+        assert isinstance(label_path, (list, tuple))
+        img_read_fn = img_read_fn if isinstance(img_read_fn, (list, tuple)) else [img_read_fn] * n
+        label_read_fn = label_read_fn if isinstance(label_read_fn, (list, tuple)) else [label_read_fn] * n
+        zthin = zthin if isinstance(zthin, (list, tuple)) else [zthin] * n
+        n_samples = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
+        seed = seed if isinstance(seed, (list, tuple)) else [seed] * n
 
-    images = torch.as_tensor(images, device=device, dtype=dtype)
+        # two options: norm per filepath, or one norm for all data
+        multi_norm = isinstance(normalization, (list, tuple))
 
-    # --- labels ---------------------------------------------------------
-    labels = None
-    if label_path is not None:
-        if isinstance(label_path, np.ndarray):
-            labels = label_path
-        else:
-            if label_read_fn is None:
-                raise ValueError(
-                    "label_read_fn must be provided when label_path is a filepath."
+        if not multi_norm:
+            # one norm for all data.
+            # first load and concat data, then apply transform / norm
+            images, labels = [], []
+            for img, ifn, lbl, lfn, zth, nsm, see in zip(
+                img_path,
+                img_read_fn,
+                label_path,
+                label_read_fn,
+                zthin,
+                n_samples,
+                seed,
+                ):
+                # only load and reshape the data
+                out = load_data( 
+                    img,
+                    img_read_fn=ifn,
+                    label_path=lbl,
+                    label_read_fn=lfn,
+                    device=device,
+                    dtype=dtype,
+                    reshape=reshape,
+                    zthin=zth,
+                    n_samples=nsm,
+                    seed=see,
+                    read_only=True,
                 )
-            labels = label_read_fn(label_path)
+                images.append(out['images'])
+                if out['labels'] is not None:
+                    labels.append(out['labels'])
+
+            # concat
+            images = torch.cat(images, dim=0)
+            if len(labels) > 0:
+                unq_labels = torch.cat([lbls[:1] for lbls in labels])
+                labels = torch.cat(labels, dim=0)
+            else:
+                labels = None
+
+            # pass through again to do transform / normalization
+            output = load_data(
+                images,
+                img_read_fn=None,  # images already loaded
+                label_path=labels,
+                device=device,
+                dtype=dtype,
+                reshape=None,
+                normalization=normalization,
+                norm_kwargs=norm_kwargs,
+                transform=transform,
+            )
+
+            return output
+
+        else:
+            # one norm for each dataset.
+            # load each data, apply tform / norm, then concat.
+            # note that this requires labels be supplied.
+
+            # modify transform to be list of list if needed
+            if transform is not None:
+                # transform is either ['log', 'fft2'] or [['log'], None, ['log', 'fft2']]
+                if isinstance(transform[0], str):
+                    transform = [transform] * n
+
+            images, labels, norms, tforms = [], [], [], []
+            for img, ifn, lbl, lfn, zth, nsm, see, nrm, nkw, trn in zip(
+                img_path,
+                img_read_fn,
+                label_path,
+                label_read_fn,
+                zthin,
+                n_samples,
+                seed,
+                normalization,
+                norm_kwargs,
+                transform
+                ):
+                out = load_data( 
+                    img,
+                    img_read_fn=ifn,
+                    label_path=lbl,
+                    label_read_fn=lfn,
+                    device=device,
+                    dtype=dtype,
+                    reshape=reshape,
+                    zthin=zth,
+                    n_samples=nsm,
+                    seed=see,
+                    normalization=nrm,
+                    norm_kwargs=nkw,
+                    transform=trn,
+                    read_only=False,
+                )
+                images.append(out['images'])
+                if out['labels'] is not None:
+                    labels.append(out['labels'])
+                if out['tform'] is not None:
+                    tforms.append(out['tform'])
+                if out['norm'] is not None:
+                    norms.append(out['norm'])
+
+            # concat
+            images = torch.cat(images, dim=0)
+            if len(labels) > 0:
+                unq_labels = torch.cat([lbls[0] for lbls in labels])
+                labels = torch.cat(labels, dim=0)
+            else:
+                labels = None
+
+            if len(tforms) > 0:
+                assert len(labels) > 0
+                tform = MultiTransform(unq_labels, tforms)
+            else:
+                tform = None
+
+            if len(norms) > 0:
+                assert len(labels) > 0
+                norm = MultiNormalization(unq_labels, norms)
+            else:
+                norm = None
+
+            output = {
+                'images': images,
+                'labels': labels,
+                'norm': norm,
+                'tform': tform,
+            }
+
+            return output
+
+    else:
+        # assume img_path and label_path are single paths
+        # --- images ---------------------------------------------------------
+        if isinstance(img_path, (np.ndarray, torch.Tensor)):
+            images = img_path
+        else:
+            assert img_read_fn is not None
+            img_read_fn = globals()[img_read_fn] if isinstance(img_read_fn, str) else img_read_fn
+            images = img_read_fn(img_path)
 
         if n_samples is not None:
-            labels = labels[idx]
+            if seed is None:
+                idx = slice(n_samples)
+            else:
+                rng = np.random.default_rng(seed)
+                idx = rng.choice(len(images), size=n_samples, replace=False)
+            images = images[idx]
         else:
-            labels = labels[:]
+            if isinstance(images, np.ndarray) and not images.flags.writeable:
+                # may be memory-mapped ndarray, so make a copy
+                images = np.asarray(images, copy=True)
 
-        labels = torch.as_tensor(labels, dtype=torch.long)
+        images = torch.as_tensor(images, device=device, dtype=dtype)
+
+        # --- labels ---------------------------------------------------------
+        labels = None
+        if label_path is not None:
+            if isinstance(label_path, (np.ndarray, torch.Tensor)):
+                labels = label_path
+            else:
+                assert label_read_fn is not None
+                label_read_fn = globals()[label_read_fn] if isinstance(label_read_fn, str) else label_read_fn
+                labels = label_read_fn(label_path)
+
+            if n_samples is not None:
+                labels = labels[idx]
+            else:
+                labels = labels[:]
+
+            labels = torch.as_tensor(labels, device=device, dtype=torch.long)
+
+        # --- reshape --------------------------------------------------------
+        if reshape == '2d':
+            images = images[:, ::zthin]
+            n_slices_per_vol = images.shape[1]
+            images = images.reshape(-1, 1, *images.shape[-2:])
+            # broadcast labels per-slice so they remain 1:1 with the reshaped images
+            if labels is not None:
+                labels = labels.repeat_interleave(n_slices_per_vol, dim=0)
+        elif reshape == '3d':
+            images = images.unsqueeze(1)
+
+        if read_only:
+            return {'images': images, 'labels': labels}
 
     # --- transforms -----------------------------------------------------
-    if log:
-        images = images.log()
+    tform = None
+    if transform is not None:
+        from cosmodiff.transform import Transform
+        if 'log' in transform:
+            log = True
+            transform = [t for t in transform if t != 'log']
+        else:
+            log = False
+        tform = Transform(transform, log=log)
 
-    if norm is not None:
-        if norm == 'center-scale':
-            images = center_scale_norm(images)
-        elif norm == 'min-max':
-            images = minmax_norm(images)
+        images = tform(images)
 
-    # --- reshape --------------------------------------------------------
-    if two_dim:
-        images = images[:, ::zthin]
-        images = images.reshape(-1, 1, *images.shape[-2:])
-    else:
-        images = images.unsqueeze(1)
+    norm = None
+    if normalization is not None:
+        norm = Normalization(normalization, inplace=False, **(norm_kwargs or {}))
+        images = norm(images)
 
-    return images, labels
+
+    output = {
+        'images': images,
+        'labels': labels,
+        'norm': norm,
+        'tform': tform,
+    }
+
+    return output
 
 
 def _import_class(qualified_name: str):
@@ -272,45 +453,6 @@ def load_checkpoint(ckpt_path: str):
     return model, noise_scheduler, optimizer, lr_scheduler, augmentations
 
 
-def minmax_norm(x: torch.Tensor) -> torch.Tensor:
-    """Normalize a tensor to ``[-1, 1]`` via min-max scaling.
-
-    Args:
-        x (torch.Tensor): Input tensor of any shape.
-
-    Returns:
-        torch.Tensor: Normalized tensor with values in ``[-1, 1]``.
-    """
-    x = x - x.min()
-    x = x / x.max()
-    return x * 2 - 1
-
-
-def center_scale_norm(x: torch.Tensor, inplace: bool = False):
-    """Center a tensor based on its mean, and normalize by its absolute deviation.
-
-    Args:
-        x (torch.Tensor): Input tensor of any shape.
-        inplace (bool): If True, edit inplace. 
-
-    Returns:
-        torch.Tensor: scaled tensor
-        float: avg
-        float: std
-    """
-    # center
-    avg = x.mean()
-    if inplace:
-        x -= avg
-    else:
-        x = x - avg
-
-    # scale by max-abs
-    x /= x.abs().max()
-
-    return x
-
-
 def parse_config_model(config: dict):
     """Instantiate model, optimizer, noise_scheduler, and lr_scheduler from a
     parsed yaml config dict. Any missing keys return ``None``, which will
@@ -320,15 +462,21 @@ def parse_config_model(config: dict):
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
     Returns:
-        tuple: ``(model, optimizer, noise_scheduler, lr_scheduler)`` where any
-        missing component is ``None``.
+        dict: A dictionary with keys ``'model'``, ``'optimizer'``,
+        ``'noise_scheduler'``, ``'lr_scheduler'``.  Each entry is the
+        corresponding instantiated object, or ``None`` if the config did
+        not specify it (or its dependencies could not be built).
 
     Example::
 
         with open("config.yaml") as f:
             config = yaml.safe_load(f)
 
-        model, optimizer, noise_scheduler, lr_scheduler = parse_model(config)
+        out = parse_config_model(config)
+        model = out['model']
+        optimizer = out['optimizer']
+        noise_scheduler = out['noise_scheduler']
+        lr_scheduler = out['lr_scheduler']
     """
     import torch.optim.lr_scheduler as lr_schedulers
 
@@ -360,29 +508,43 @@ def parse_config_model(config: dict):
         lr_cls = getattr(lr_schedulers, config["lr_scheduler"]["class"])
         lr_scheduler = lr_cls(optimizer, **config["lr_scheduler"].get("kwargs", {}))
 
-    return model, optimizer, noise_scheduler, lr_scheduler
+    output = {
+        'model': model,
+        'optimizer': optimizer,
+        'noise_scheduler': noise_scheduler,
+        'lr_scheduler': lr_scheduler
+    }
+
+    return output
 
 
 def parse_config_data(config: dict):
     """Load data and build an ``ArrayDataset`` from a parsed yaml config dict.
 
-    Read functions are resolved by name from ``cosmodiff.utils``. Any callable
-    in that module can be referenced by name in the yaml config.
-
     Args:
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
     Returns:
-        ArrayDataset: Dataset ready to be passed to ``train()``.
+        dict: A dictionary with keys
+
+            * ``'data'`` — :class:`ArrayDataset` ready to be passed to
+              ``train()``.
+            * ``'norm'`` — fitted :class:`Normalization` instance, or
+              ``None`` if normalization was not requested.
+            * ``'tform'`` — fitted :class:`Transform` instance, or ``None``
+              if no ``transform`` list was given in the config.
 
     Example::
 
         with open("config.yaml") as f:
             config = yaml.safe_load(f)
 
-        dataset = parse_config_data(config)
+        out = parse_config_data(config)
+        dataset = out['data']
+        norm = out['norm']
+        tform = out['tform']
     """
-    import cosmodiff.utils as utils_module
+    from cosmodiff import utils
     from cosmodiff.utils import ArrayDataset, load_data
 
     data_cfg = config["data"]
@@ -392,64 +554,45 @@ def parse_config_data(config: dict):
     device = "cpu" if data_cfg.get("keep_on_cpu", False) \
         else global_cfg.get("device", "cpu")
 
-    img_read_fn = getattr(utils_module, data_cfg["img_read_fn"])
 
-    label_path = data_cfg.get("label_path", None)
-    label_read_fn = None
-    if "label_read_fn" in data_cfg:
-        label_read_fn = getattr(utils_module, data_cfg["label_read_fn"])
-
-    img_path = data_cfg["img_path"]
-    n_samples = data_cfg.get("n_samples", None)
-    seed = data_cfg.get("seed", None)
-    log = data_cfg.get("log", False)
-
-    _load_kwargs = dict(
-        img_read_fn=img_read_fn,
+    out = load_data(
+        img_path=data_cfg["img_path"],
+        img_read_fn=data_cfg.get('img_read_fn', None),
         device=device,
         dtype=dtype,
-        label_read_fn=label_read_fn,
-        norm=data_cfg.get("norm", 'center-scale'),
-        two_dim=data_cfg.get("two_dim", True),
+        label_path=data_cfg.get("label_path", None),
+        label_read_fn=data_cfg.get('label_read_fn', None),
+        reshape=data_cfg.get("reshape", '2d'),
         zthin=data_cfg.get("zthin", 1),
+        n_samples=data_cfg.get("n_samples", None),
+        seed=data_cfg.get("seed", None),
+        normalization=data_cfg.get('normalization', None),
+        norm_kwargs=data_cfg.get('norm_kwargs', None),
+        transform=data_cfg.get('transform', None),
     )
-
-    if isinstance(img_path, (list, tuple)):
-        n = len(img_path)
-        label_paths = label_path if isinstance(label_path, (list, tuple)) else [label_path] * n
-        n_samples_list = n_samples if isinstance(n_samples, (list, tuple)) else [n_samples] * n
-        seeds_list = seed if isinstance(seed, (list, tuple)) else [seed] * n
-        log_list = log if isinstance(log, (list, tuple)) else [log] * n
-
-        all_images, all_labels = [], []
-        for p, lp, ns, sd, lg in zip(img_path, label_paths, n_samples_list, seeds_list, log_list):
-            imgs, lbls = load_data(img_path=p, label_path=lp, n_samples=ns, seed=sd, log=lg, **_load_kwargs)
-            all_images.append(imgs)
-            if lbls is not None:
-                all_labels.append(lbls)
-
-        images = torch.cat(all_images, dim=0)
-        labels = torch.cat(all_labels, dim=0) if all_labels else None
-    else:
-        images, labels = load_data(
-            img_path=img_path,
-            label_path=label_path,
-            n_samples=n_samples,
-            seed=seed,
-            log=log,
-            **_load_kwargs,
-        )
 
     augmentations = None
     if "augmentations" in config:
         from cosmodiff.augment import config_augmentations
         augmentations = config_augmentations(config["augmentations"])
 
-    return ArrayDataset(images, labels=labels, augmentations=augmentations)
+    output = {
+        'data': ArrayDataset(
+            out['images'], labels=out['labels'], augmentations=augmentations,
+        ),
+        'norm': out['norm'],
+        'tform': out['tform'],
+    }
+
+    return output
 
 
 def npy_read_fn(fname):
     return np.load(fname, mmap_mode='r')
+
+
+def txt_read_fn(fname):
+    return np.loadtxt(fname)
 
 
 def read_logs(output_dir: str) -> dict:
@@ -537,8 +680,8 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     Example::
 
         # from dict
-        metrics = train(dataset, model)
-        plot_metrics(metrics, show=True)
+        result = train(dataset, model)
+        plot_metrics(result['metrics'], show=True)
 
         # from file
         plot_metrics("output/metrics_epoch_49.json", save_dir="output/plots")
@@ -607,6 +750,42 @@ def plot_metrics(metrics: dict | str, save_dir: str = None, show: bool = False) 
     #plt.close(fig)
 
     return fig1, fig2, fig3
+
+
+def plot_ema_profiles(profiles: dict, ax=None):
+    """Plot per-checkpoint and synthesized EMA weight profiles.
+
+    Takes the dict returned by ``cosmodiff.optim.compute_ema_profiles`` and
+    produces a figure analogous to Fig. 4 of Karras et al. 2024.
+
+    Args:
+        profiles: output of ``compute_ema_profiles``.
+        ax: existing Axes to draw on; creates a new figure if ``None``.
+
+    Returns:
+        matplotlib Axes.
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    epochs = profiles['epochs']
+
+    for t_i, s_j, w in profiles['basis']:
+        ax.plot(epochs, w, color='steelblue', alpha=0.4, linewidth=0.8,
+                label=rf'checkpoint epoch {t_i}, $\sigma_{{rel}}$={s_j}')
+
+    ax.plot(epochs, profiles['target'], 'k--', linewidth=1.5,
+            label=r'target profile')
+    ax.plot(epochs, profiles['synthesized'], 'r-', linewidth=2,
+            label=r'synthesized profile')
+
+    ax.set_xlabel('Training epoch')
+    ax.set_ylabel('EMA weight (normalized)')
+    ax.legend(fontsize=7)
+
+    return ax
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:

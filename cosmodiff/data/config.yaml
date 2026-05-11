@@ -1,0 +1,119 @@
+# cosmodiff training config
+
+# --- global ---
+global:
+  device: cpu
+  dtype: float32
+
+# --- io ---
+io:
+  output_dir: /path/to/output
+
+# --- data ---
+data:
+  img_path: /path/to/images.npy
+  img_read_fn: npy_read_fn        # any function in cosmodiff.utils
+  label_path: /path/to/labels.npy # optional
+  label_read_fn: npy_read_fn      # optional
+  reshape: 2d                 # '2d' (z-slice → channel), '3d' (volume), or null (no reshape)
+  zthin: 4                    # thinning factor along z when reshape='2d'
+  n_samples: null
+  seed: null
+  keep_on_cpu: true
+  normalization: center-max  # data norm and kwargs
+  norm_kwargs:
+    center: null
+    xmax: null
+    alpha: null
+    beta: null
+  transform:
+    [log]
+
+# --- augmentations ---
+augmentations:
+  RandomRoll:
+    size: 128
+    dims: [-1, -2]
+  RandomFlip:
+    dims: [-1, -2]
+    p: 0.5
+
+# --- model ---
+model:
+  class: UNet2DModel
+  kwargs:
+    sample_size: 64
+    in_channels: 1
+    out_channels: 1
+    layers_per_block: 2
+    block_out_channels: [64, 128, 256]
+    down_block_types:
+      - DownBlock2D
+      - DownBlock2D
+      - DownBlock2D
+    up_block_types:
+      - UpBlock2D
+      - UpBlock2D
+      - UpBlock2D
+    norm_num_groups: 32
+
+# --- noise scheduler ---
+noise_scheduler:
+  class: DDPMScheduler
+  kwargs:
+    num_train_timesteps: 1000
+    rescale_betas_zero_snr: true
+
+# --- optimizer ---
+optimizer:
+  class: AdamW
+  kwargs:
+    lr: 1.0e-4
+    weight_decay: 1.0e-2
+
+# --- lr scheduler ---
+lr_scheduler:
+  class: ConstantLR
+  kwargs:
+    factor: 1.0
+    total_iters: 0
+
+# --- training ---
+train:
+  num_epochs: 50
+  batch_size: 16
+  shuffle: true
+  checkpoint_every_n_epochs: 5
+  mixed_precision: fp16
+  gradient_accumulation_steps: 1
+  dataloader_num_workers: 4
+  max_grad_norm: 1.0
+  conditioning: discrete       # 'discrete' (class_labels) or 'continuous' (encoder_hidden_states)
+  cfg_dropout: 0.0             # fraction of labels dropped for CFG training (0 disables)
+  ema_sigma_rels: [.02, .10]   # e.g. [0.02, 0.10] to enable post-hoc EMA tracking
+  ema_update_every: 1          # optimizer steps between EMA updates (Karras assumes per-step)
+  ema_burn_in: 1000            # skip first N optimizer steps before starting EMA tracking
+  min_snr_gamma: null          # set to e.g. 5.0 to enable Min-SNR loss weighting (Hang et al. 2023)
+  sigma_log_normal: null       # set to e.g. [-1.2, 1.2] for EDM-style log-σ ~ Normal(P_mean, P_std) sampling
+  verbose: true
+  force_cpu: false
+  pin_memory: false
+
+# --- generation ---
+generate:
+  scheduler: null              # new scheduler for inference, default is train scheduler
+  num_steps: null              # number of inference steps, default is training steps
+  s_churn: null                # EDM stochasticity (Euler/Heun-family only); 0=ODE, larger=more SDE-like
+  s_tmin: null                 # restrict churn to t >= s_tmin
+  s_tmax: null                 # restrict churn to t <= s_tmax
+  s_noise: null                # noise magnitude multiplier during churn (default 1.0)
+  n_samples: 64                # total number of samples to generate
+  batch_size: null             # samples per forward pass; null → single batch of n_samples
+  image_shape: null            # e.g. [1, 64, 64]; null → inferred from model.config
+  conditioning: discrete       # 'discrete' or 'continuous' (must match training)
+  labels: null                 # discrete: list of int class labels (length 1 or n_samples)
+  continuous_labels: null      # continuous: path to .npy of shape (n_samples, D) or (1, D)
+  guidance_scale: null         # CFG guidance scale; null disables amplification
+  ema_sigma_rel: null          # synthesize EMA at this target before sampling; null disables
+  seed: null                   # set for reproducibility
+  device: null                 # null → cuda if available else cpu

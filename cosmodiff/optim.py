@@ -1,4 +1,5 @@
 import os
+import inspect
 import pickle
 import yaml
 import numpy as np
@@ -24,6 +25,163 @@ def _to_yaml_safe(obj):
     return obj
 
 
+def _is_flow_matching(scheduler) -> bool:
+    """True if ``scheduler`` is a flow-matching variant.
+
+    Detects ``FlowMatchEulerDiscreteScheduler``, ``FlowMatchHeunDiscreteScheduler``,
+    and any future ``FlowMatch*`` scheduler in ``diffusers``. The branching in
+    :func:`train` keys off this to use linear interpolation + velocity target
+    instead of the DDPM-style ``add_noise`` + ``prediction_type`` switch.
+    """
+    return type(scheduler).__name__.startswith('FlowMatch')
+
+
+def sample_timesteps(
+    scheduler,
+    batch_size: int,
+    device: str = 'cpu',
+    sigma_log_normal: Optional[tuple] = None,
+    log_sigma_schedule: Optional[torch.Tensor] = None,
+):
+    """Sample per-batch timesteps for training.
+
+    Dispatches on the scheduler family.  For flow-matching schedulers,
+    samples an interpolation parameter ``sigma`` in ``[0, 1]`` (uniformly
+    by default, or via a logit-normal if ``sigma_log_normal`` is given,
+    matching the SD3-style training distribution).  For diffusion
+    schedulers, samples integer timesteps in ``[0, T)`` — uniformly by
+    default, or via EDM-style log-σ sampling backed by
+    ``log_sigma_schedule``.
+
+    Args:
+        scheduler: A ``diffusers`` scheduler.  Flow-matching variants are
+            detected by class name (``FlowMatch*``); all other schedulers
+            are treated as DDPM-style.  Used to read
+            ``scheduler.config.num_train_timesteps`` (denoted ``T``) and
+            to determine the timestep dtype convention.
+        batch_size (int): Number of timesteps to sample (one per batch item).
+        device: Target device for the returned tensors (e.g. ``'cpu'``,
+            ``'cuda'``, or a ``torch.device``).
+        sigma_log_normal (tuple of float, optional): ``(P_mean, P_std)``.
+            Under flow matching, samples are drawn as
+            ``sigmoid(P_mean + P_std * randn)`` (SD3-style logit-normal
+            ``t`` distribution).  Under diffusion, samples are drawn as
+            ``log σ ~ Normal(P_mean, P_std)`` and mapped to the nearest
+            discrete timestep via ``log_sigma_schedule``.  ``None``
+            (default) uses uniform sampling.
+        log_sigma_schedule (torch.Tensor, optional): Precomputed
+            ``log σ`` values for the diffusion scheduler at each integer
+            timestep (shape ``(T,)``, monotonically increasing in ``t``).
+            Required only when ``sigma_log_normal`` is set and the
+            scheduler is *not* flow matching; ignored otherwise.
+
+    Returns:
+        tuple: ``(timesteps, sigma)``.
+
+            * ``timesteps`` (torch.Tensor of shape ``(batch_size,)``):
+              for diffusion, an integer ``long`` tensor in ``[0, T)``;
+              for flow matching, a float tensor in ``[0, T)`` (equal to
+              ``sigma * T``).
+            * ``sigma`` (torch.Tensor of shape ``(batch_size,)`` or
+              ``None``): the FM interpolant in ``[0, 1]`` when
+              ``scheduler`` is flow matching; ``None`` for diffusion
+              schedulers (which don't expose a sigma at this stage).
+    """
+    T = scheduler.config.num_train_timesteps
+    if _is_flow_matching(scheduler):
+        # FM: sample sigma in [0, 1] (optionally logit-normal à la SD3)
+        if sigma_log_normal is not None:
+            P_mean, P_std = sigma_log_normal
+            sigma = torch.sigmoid(P_mean + P_std * torch.randn(batch_size, device=device))
+        else:
+            sigma = torch.rand(batch_size, device=device)
+        timesteps = (sigma * T).clamp(0, T - 1)
+        return timesteps, sigma
+
+    # diffusion branch
+    if sigma_log_normal is not None and log_sigma_schedule is not None:
+        P_mean, P_std = sigma_log_normal
+        log_sigma = P_mean + P_std * torch.randn(batch_size, device=device)
+        sched = log_sigma_schedule.to(device)
+        log_sigma = torch.clamp(log_sigma, sched.min().item(), sched.max().item())
+        timesteps = torch.searchsorted(sched, log_sigma)
+        timesteps = torch.clamp(timesteps, 0, T - 1).long()
+    else:
+        timesteps = torch.randint(0, T, (batch_size,), device=device).long()
+    return timesteps, None
+
+
+def noise_and_target(
+    scheduler,
+    samples: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    sigma: Optional[torch.Tensor] = None,
+):
+    """Compute ``(noisy_samples, target)`` for one training step.
+
+    Dispatches on the scheduler family.  For flow-matching schedulers the
+    noisy sample is a linear interpolation between data and noise via
+    ``sigma``, and the target is the constant velocity field
+    ``noise - samples``.  For diffusion schedulers the noisy sample is
+    produced by ``scheduler.add_noise`` and the target depends on
+    ``scheduler.config.prediction_type`` (``epsilon``, ``v_prediction``,
+    or ``sample``).
+
+    Args:
+        scheduler: A ``diffusers`` scheduler.  Flow-matching variants are
+            detected by class name (``FlowMatch*``).  For diffusion
+            schedulers, ``scheduler.config.prediction_type`` selects the
+            target form and ``scheduler.add_noise`` /
+            ``scheduler.get_velocity`` provide the noised sample and
+            ``v_prediction`` target respectively.
+        samples (torch.Tensor): Clean training samples of shape
+            ``(B, ...)``.  For 2D images this is typically
+            ``(B, C, H, W)``.
+        noise (torch.Tensor): Gaussian noise tensor with the same shape
+            and dtype as ``samples`` (typically drawn from
+            ``torch.randn_like(samples)``).
+        timesteps (torch.Tensor): Per-batch timesteps of shape ``(B,)``
+            as returned by :func:`sample_timesteps`.  Integer dtype for
+            diffusion, float for flow matching.
+        sigma (torch.Tensor, optional): The FM interpolant of shape
+            ``(B,)`` in ``[0, 1]``, as returned by :func:`sample_timesteps`
+            for flow-matching schedulers.  Required when ``scheduler`` is
+            flow matching; ignored otherwise.
+
+    Returns:
+        tuple: ``(noisy_samples, target)``, both ``torch.Tensor`` with the
+        same shape and dtype as ``samples``.
+
+            * ``noisy_samples``: input fed to the model (the network's
+              ``x_t``).
+            * ``target``: the regression target for the MSE loss.
+
+    Raises:
+        ValueError: If ``scheduler`` is a diffusion scheduler with an
+            unsupported ``prediction_type``.
+    """
+    if _is_flow_matching(scheduler):
+        # Flow Matching
+        sigma_b = sigma.view(-1, *[1] * (samples.ndim - 1))
+        noisy = sigma_b * noise + (1.0 - sigma_b) * samples
+        target = noise - samples
+        return noisy, target
+
+    # DDPM
+    noisy = scheduler.add_noise(samples, noise, timesteps)
+    prediction_type = scheduler.config.prediction_type
+    if prediction_type == 'epsilon':
+        target = noise
+    elif prediction_type == 'v_prediction':
+        target = scheduler.get_velocity(samples, noise, timesteps)
+    elif prediction_type == 'sample':
+        target = samples
+    else:
+        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+    return noisy, target
+
+
 def train(
     dataset,
     model=None,
@@ -43,6 +201,13 @@ def train(
     max_grad_norm: float = 1.0,
     force_cpu: bool = False,
     pin_memory: bool = False,
+    cfg_dropout: float = 0.0,
+    conditioning: str = 'discrete',
+    ema_sigma_rels: Optional[tuple] = None,
+    ema_update_every: int = 1,
+    ema_burn_in: int = 0,
+    min_snr_gamma: Optional[float] = None,
+    sigma_log_normal: Optional[tuple] = None,
     verbose: bool = True,
 ):
     """Train a diffusers diffusion model.
@@ -98,6 +263,56 @@ def train(
             ``1.0``.
         force_cpu (bool): Force the model to the CPU even if CUDA available
         pin_memory (bool): pin dataset memory if on CPU
+        cfg_dropout (float): Fraction of training batches where labels are
+            replaced with a null token (``class_labels`` mode) or zeros
+            (``encoder_hidden_states`` mode) for classifier-free guidance
+            training. Set to ``0.0`` (default) to disable CFG.
+        conditioning (str): How labels are passed to the model.
+            ``'discrete'`` (default) passes integer labels via
+            ``class_labels=`` (e.g. ``UNet2DModel`` with ``num_class_embeds``
+            or ``DiTTransformer2DModel``).  ``'continuous'`` passes float
+            labels via ``encoder_hidden_states=`` (e.g.
+            ``UNet2DConditionModel``); labels of shape ``(B, D)`` are
+            automatically unsqueezed to ``(B, 1, D)``.
+        ema_sigma_rels (tuple of float, optional): If set, enables post-hoc
+            EMA tracking via ``ema-pytorch``.  Two values are required (e.g.
+            ``(0.03, 0.15)``); they control the two power-function EMA
+            profiles checkpointed at each epoch.  Choose them to bracket the
+            target ``sigma_rel`` range you want to synthesize, with the lower
+            value anchoring your floor and the upper value giving some
+            headroom above your ceiling.  After training,
+            ``ema.synthesize_ema_model(sigma_rel=...)`` reconstructs any
+            target profile from those snapshots.  ``None`` (default) disables
+            EMA entirely.
+        ema_update_every (int): How often (in optimizer steps) to update the
+            EMA profiles.  Defaults to ``1`` (every step), matching the Karras
+            et al. 2024 reference implementation and the broader diffusion
+            training literature.  Larger values silently distort the EMA
+            profile because the time-varying beta formula assumes per-step
+            updates — only increase if profiling shows the EMA lerp is a
+            meaningful fraction of step time.
+        ema_burn_in (int): Number of initial optimizer steps during which the
+            EMA is *not* updated.  Defaults to ``0`` (start tracking from step
+            0).  When set, the EMA's internal time origin shifts to step
+            ``ema_burn_in``, so ``sigma_rel`` is interpreted as a fraction of
+            the post-burn-in trajectory ``[ema_burn_in, T_total]``.  Useful to
+            avoid contaminating the EMA with the very-early random/unstable
+            weights, particularly for wider EMA profiles.
+        min_snr_gamma (float, optional): If set, applies Min-SNR loss
+            weighting from Hang et al. 2023.  Recommended value is ``5.0``.
+            The per-sample loss is multiplied by ``min(SNR(t), gamma)``
+            divided by a parameterization-dependent factor (``SNR(t)`` for
+            epsilon-prediction, ``SNR(t)+1`` for v-prediction, ``1`` for
+            sample-prediction), which balances training signal across
+            timesteps and is especially helpful for v-prediction.  ``None``
+            (default) disables Min-SNR (uniform MSE).
+        sigma_log_normal (tuple of float, optional): If set to a
+            ``(P_mean, P_std)`` tuple, samples log-σ from ``Normal(P_mean,
+            P_std)`` each step (Karras et al. EDM 2022) instead of uniform
+            timestep sampling.  Sampled log-σ is mapped to the nearest
+            discrete timestep of the underlying scheduler via
+            ``torch.searchsorted``.  EDM defaults are ``(-1.2, 1.2)``.
+            ``None`` (default) keeps standard uniform timestep sampling.
         verbose (bool): Print training progress and checkpoint messages.
             Defaults to ``True``.
 
@@ -207,6 +422,33 @@ def train(
     if resume_from_checkpoint is not None:
         accelerator.load_state(resume_from_checkpoint)
 
+    # post-hoc EMA (fresh each run; not restored on resume)
+    ema = None
+    if ema_sigma_rels is not None:
+        from pathlib import Path
+        from ema_pytorch import PostHocEMA
+        ema = PostHocEMA(
+            accelerator.unwrap_model(model),
+            sigma_rels=ema_sigma_rels,
+            checkpoint_every_num_steps='manual',
+            checkpoint_folder=Path(output_dir) / 'ema',
+            update_every=ema_update_every,
+        )
+
+    # null token for CFG label dropout (class_labels mode only)
+    cfg_null_token = None
+    if cfg_dropout > 0.0 and conditioning == 'discrete':
+        cfg_null_token = accelerator.unwrap_model(model).config.num_class_embeds - 1
+
+    # precompute log-σ schedule for EDM-style log-normal sigma sampling
+    # (only meaningful for diffusion schedulers; FM uses sigma_log_normal as
+    # logit-normal `t` parameters directly — no schedule lookup needed)
+    log_sigma_schedule = None
+    if sigma_log_normal is not None and not _is_flow_matching(noise_scheduler):
+        alphas_cumprod = noise_scheduler.alphas_cumprod.clamp(min=1e-10)
+        log_sigma_schedule = 0.5 * torch.log((1.0 - alphas_cumprod) / alphas_cumprod)
+        # monotonically increasing in t; we'll map sampled log-σ to nearest t via searchsorted
+
     # ------------------------------------------------------------------ #
     # 5.  Training loop                                                    #
     # ------------------------------------------------------------------ #
@@ -235,37 +477,64 @@ def train(
         for batch in progress:
             images = batch["images"]
             labels = batch.get("labels", None)
+            if labels is not None and cfg_dropout > 0.0:
+                drop_mask = torch.rand(labels.shape[0], device=labels.device) < cfg_dropout
+                if conditioning == 'discrete':
+                    labels = torch.where(drop_mask, torch.full_like(labels, cfg_null_token), labels)
+                else:
+                    mask = drop_mask.view(-1, *([1] * (labels.ndim - 1)))
+                    labels = torch.where(mask, torch.zeros_like(labels), labels)
 
             t0 = time.time()
 
             with accelerator.accumulate(model):
-                # --- forward diffusion ----------------------------------
+                # --- forward diffusion (or FM linear interpolation) -----
                 noise = torch.randn_like(images)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (images.shape[0],),
+                timesteps, sigma = sample_timesteps(
+                    noise_scheduler,
+                    images.shape[0],
                     device=images.device,
-                ).long()
-                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+                    sigma_log_normal=sigma_log_normal,
+                    log_sigma_schedule=log_sigma_schedule,
+                )
+                noisy_images, target = noise_and_target(
+                    noise_scheduler, images, noise, timesteps, sigma=sigma,
+                )
 
                 # --- predict noise --------------------------------------
                 with accelerator.autocast():
                     if labels is not None:
-                        noise_pred = model(
-                            noisy_images,
-                            timestep=timesteps,
-                            class_labels=labels,
-                            return_dict=False,
-                        )[0]
+                        if conditioning == 'discrete':
+                            cond_kwargs = {'class_labels': labels}
+                        else:
+                            cond = labels.float()
+                            if cond.ndim == 2:
+                                cond = cond.unsqueeze(1)
+                            cond_kwargs = {'encoder_hidden_states': cond}
+                        pred = model(noisy_images, timestep=timesteps, return_dict=False, **cond_kwargs)[0]
                     else:
-                        noise_pred = model(
-                            noisy_images,
-                            timesteps,
-                            return_dict=False,
-                        )[0]
+                        pred = model(noisy_images, timesteps, return_dict=False)[0]
 
-                    loss = F.mse_loss(noise_pred, noise)
+                    if min_snr_gamma is None or _is_flow_matching(noise_scheduler):
+                        # Min-SNR is a DDPM-style weighting and does not apply
+                        # to flow matching — use plain MSE in that case.
+                        loss = F.mse_loss(pred, target)
+                    else:
+                        # Min-SNR loss weighting (Hang et al. 2023). SNR = α_bar / (1 - α_bar).
+                        prediction_type = noise_scheduler.config.prediction_type
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+                        snr = alphas_cumprod[timesteps] / (1.0 - alphas_cumprod[timesteps])
+                        clipped_snr = torch.clamp(snr, max=min_snr_gamma)
+                        if prediction_type == 'epsilon':
+                            weight = clipped_snr / snr
+                        elif prediction_type == 'sample':
+                            weight = clipped_snr
+                        else:  # v_prediction
+                            weight = clipped_snr / (snr + 1.0)
+                        per_sample_mse = F.mse_loss(pred, target, reduction='none').mean(
+                            dim=list(range(1, pred.ndim))
+                        )
+                        loss = (weight * per_sample_mse).mean()
 
                 # --- backward -------------------------------------------
                 accelerator.backward(loss)
@@ -274,6 +543,9 @@ def train(
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            if ema is not None and global_step >= ema_burn_in:
+                ema.update()
 
             lr_scheduler.step()
             batch_time = time.time() - t0
@@ -327,12 +599,20 @@ def train(
                         "class": f"{raw_sched.__class__.__module__}.{raw_sched.__class__.__name__}",
                         "kwargs": utils._get_lr_scheduler_kwargs(raw_sched),
                     },
+                    "ema_sigma_rels": list(ema_sigma_rels) if ema_sigma_rels is not None else None,
+                    "ema_burn_in": ema_burn_in,
                 }
                 with open(os.path.join(ckpt_save_path, "checkpoint_config.yaml"), "w") as f:
                     yaml.dump(_to_yaml_safe(ckpt_cfg), f)
 
                 # Model weights (via hook) + optimizer moments + grad scaler + RNG
                 accelerator.save_state(ckpt_save_path)
+
+                if ema is not None and ema.step.item() > 0:
+                    from pathlib import Path
+                    ema.checkpoint_folder = Path(ckpt_save_path) / 'ema'
+                    ema.checkpoint_folder.mkdir(exist_ok=True)
+                    ema.checkpoint()
 
                 if hasattr(dataset, "augmentations") and dataset.augmentations is not None:
                     with open(os.path.join(ckpt_save_path, "augmentations.pkl"), "wb") as f:
@@ -345,7 +625,7 @@ def train(
                     accelerator.print(f"Checkpoint saved → {ckpt_save_path}")
 
     accelerator.end_training()
-    return metrics
+    return {'metrics': metrics, 'ema': ema}
 
 
 @torch.no_grad()
@@ -355,16 +635,23 @@ def generate(
     batch_size: int = 1,
     image_shape: tuple[int, ...] = (1, 64, 64),
     labels: Optional[torch.Tensor] = None,
-    ddim_thinning: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
+    conditioning: str = 'discrete',
+    num_steps: Optional[int] = None,
+    s_churn: Optional[float] = None,
+    s_tmin: Optional[float] = None,
+    s_tmax: Optional[float] = None,
+    s_noise: Optional[float] = None,
     renorm: Optional[Callable] = None,
     device: Optional[torch.device] = None,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Generate a batch of novel images via reverse diffusion.
 
-    Compatible with DDPMScheduler and DDIMScheduler. The number of inference
-    steps defaults to ``noise_scheduler.config.num_train_timesteps``, or can
-    be reduced via ``ddim_thinning`` for faster DDIM sampling.
+    Compatible with any ``diffusers`` scheduler exposing
+    ``set_timesteps`` / ``step``. The number of inference steps defaults to
+    ``noise_scheduler.config.num_train_timesteps`` and can be reduced via
+    ``num_steps`` for faster sampling (DDIM, DPM-Solver, Heun, etc.).
 
     Args:
         model: Trained diffusers model (UNet2DModel or DiTTransformer2DModel).
@@ -372,13 +659,39 @@ def generate(
             any compatible scheduler with ``set_timesteps`` and ``step``).
         batch_size (int): Number of images to generate.
         image_shape (tuple): Shape of each image ``(C, H, W)``.
-        labels (array-like, optional): Class indices of length ``batch_size``.
-            Required for class-conditional models (e.g. DiTTransformer2DModel);
-            ignored otherwise.
-        ddim_thinning (int, optional): Thinning factor relative to
-            ``num_train_timesteps``. E.g. ``ddim_thinning=10`` with 1000
-            training steps runs 100 inference steps. Only meaningful with
-            DDIMScheduler; ignored (``None``) for DDPM.
+        labels (array-like, optional): Conditioning labels of length
+            ``batch_size``.  Integer class indices for ``'class_labels'`` mode;
+            float array of shape ``(batch_size, D)`` for
+            ``'encoder_hidden_states'`` mode.
+        guidance_scale (float, optional): Classifier-free guidance scale.
+            ``None`` (default) uses the plain conditional prediction with no
+            amplification.  A float in ``[1.0, 15.0]`` runs a double forward
+            pass with null labels and controls class adherence:
+            ``uncond + scale * (cond - uncond)``.
+        conditioning (str): Matches the mode used during training.
+            ``'discrete'`` (default) for integer class labels;
+            ``'continuous'`` for continuous float labels.
+        num_steps (int, optional): Number of inference steps to run. Passed
+            directly to ``noise_scheduler.set_timesteps``. Defaults to
+            ``noise_scheduler.config.num_train_timesteps`` (full schedule).
+            Use a smaller value with a higher-order solver (DDIM, DPM-Solver,
+            Heun, etc.) for fast sampling.
+        s_churn (float, optional): EDM-style stochasticity injection
+            (Karras et al. 2022).  ``0`` (the scheduler default) gives pure
+            ODE sampling; larger values inject more noise at each step,
+            interpolating toward SDE-like behavior.  Only consumed by
+            schedulers that accept it (Euler/Heun-family, including the
+            flow-matching variants); silently dropped for schedulers that
+            don't (DDPM, DDIM, DPM-Solver, etc.).
+        s_tmin (float, optional): Lower-bound timestep for churn gating.
+            Churn is only applied when ``t >= s_tmin``. Same compatibility
+            rules as ``s_churn``.
+        s_tmax (float, optional): Upper-bound timestep for churn gating.
+            Churn is only applied when ``t <= s_tmax``. Same compatibility
+            rules as ``s_churn``.
+        s_noise (float, optional): Multiplier on the magnitude of injected
+            noise during churn (default ``1.0`` in diffusers).  Same
+            compatibility rules as ``s_churn``.
         renorm (callable, optional): Applied to the output tensor to convert
             images back to their original range (e.g. inverse of the
             normalization used at training time).
@@ -396,7 +709,7 @@ def generate(
 
     model.eval()
     num_train_timesteps = noise_scheduler.config.num_train_timesteps
-    num_inference_steps = num_train_timesteps // ddim_thinning if ddim_thinning is not None else num_train_timesteps
+    num_inference_steps = num_steps if num_steps is not None else num_train_timesteps
     noise_scheduler.set_timesteps(num_inference_steps)
 
     images = torch.randn(
@@ -406,27 +719,265 @@ def generate(
     )
 
     if labels is not None:
-        labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+        if conditioning == 'discrete':
+            labels = torch.as_tensor(labels, dtype=torch.long, device=device)
+        else:
+            labels = torch.as_tensor(labels, dtype=torch.float, device=device)
+            if labels.ndim == 2:
+                labels = labels.unsqueeze(1)  # (B, D) -> (B, 1, D)
+
+    null_labels = None
+    if labels is not None and guidance_scale is not None:
+        if conditioning == 'discrete':
+            null_token = model.config.num_class_embeds - 1
+            null_labels = torch.full_like(labels, null_token)
+        else:
+            null_labels = torch.zeros_like(labels)
+
+    # Filter EDM-style stochasticity kwargs to those this scheduler's
+    # `step()` actually accepts (Euler/Heun-family, including FM variants).
+    # Unsupported keys are silently dropped so the same generate() call
+    # works across all scheduler types.
+    step_supported = set(inspect.signature(noise_scheduler.step).parameters)
+    step_kwargs = {
+        k: v for k, v in (
+            ('s_churn', s_churn), ('s_tmin', s_tmin),
+            ('s_tmax', s_tmax),   ('s_noise', s_noise),
+        )
+        if v is not None and k in step_supported
+    }
 
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
-        timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        # FM schedulers use float timesteps; DDPM-family use int — preserve dtype.
+        timesteps = torch.full((batch_size,), t.item() if hasattr(t, 'item') else t,
+                               device=device, dtype=t.dtype if hasattr(t, 'dtype') else torch.long)
+
+        # Rescale the state into the form the model expects (identity for
+        # VP/DDIM/DPM-Solver/FlowMatch, division by √(σ²+1) for Euler/Heun
+        # on VP-trained models).  Pass scaled to the model; pass unscaled
+        # `images` to scheduler.step which integrates in its native space.
+        # FlowMatch schedulers don't define scale_model_input at all, so
+        # we fall through to identity in that case.
+        if hasattr(noise_scheduler, 'scale_model_input'):
+            images_input = noise_scheduler.scale_model_input(images, t)
+        else:
+            images_input = images
 
         if labels is not None:
-            noise_pred = model(
-                images,
-                timestep=timesteps,
-                class_labels=labels,
-                return_dict=False,
-            )[0]
+            cond_key = 'class_labels' if conditioning == 'discrete' else 'encoder_hidden_states'
+            pred = model(images_input, timestep=timesteps, return_dict=False, **{cond_key: labels})[0]
+            if null_labels is not None:
+                uncond_pred = model(images_input, timestep=timesteps, return_dict=False, **{cond_key: null_labels})[0]
+                pred = uncond_pred + guidance_scale * (pred - uncond_pred)
         else:
-            noise_pred = model(images, timesteps, return_dict=False)[0]
+            pred = model(images_input, timesteps, return_dict=False)[0]
 
-        images = noise_scheduler.step(noise_pred, t, images, generator=generator).prev_sample
+        images = noise_scheduler.step(
+            pred, t, images, generator=generator, **step_kwargs,
+        ).prev_sample
 
     if renorm is not None:
         images = renorm(images)
 
     return images
+
+
+def gamma_from_sigma_rel(sigma_rel: float) -> float:
+    """Convert a sigma_rel value to the corresponding power-function EMA exponent gamma.
+
+    The power-function EMA assigns weight ``w(x) = (gamma+1) * x^gamma`` to
+    training progress ``x = s/t`` in ``[0, 1]``.  ``sigma_rel`` is the
+    standard deviation of that distribution and is also equal to the relative
+    EMA length (fraction of training): ``sigma_rel=0.1`` means the EMA draws
+    its weight from roughly the last 10% of training (Karras et al. 2024,
+    Sec. 3.1).
+
+    Args:
+        sigma_rel: relative standard deviation of the EMA kernel (e.g. 0.05 or 0.28).
+
+    Returns:
+        Corresponding gamma exponent.
+    """
+    from scipy.optimize import brentq
+
+    def _f(gamma):
+        mean = (gamma + 1) / (gamma + 2)
+        second_moment = (gamma + 1) / (gamma + 3)
+        return np.sqrt(second_moment - mean ** 2) - sigma_rel
+
+    return brentq(_f, 1e-4, 1e4)
+
+
+def compute_ema_profiles(
+    sigma_rels_train: tuple,
+    checkpoint_epochs: list,
+    total_epochs: int,
+    sigma_rel_target: float,
+) -> dict:
+    """Compute per-checkpoint and synthesized EMA weight profiles.
+
+    Implements the analysis behind Fig. 4 of Karras et al. 2024.  For each
+    ``(checkpoint_epoch, sigma_rel)`` pair a basis profile is computed; the
+    synthesized profile is the non-negative least-squares combination that
+    best approximates the target profile.
+
+    Args:
+        sigma_rels_train: sigma_rel values used during training (e.g. ``(0.05, 0.28)``).
+        checkpoint_epochs: epochs at which ``ema.checkpoint()`` was called.
+        total_epochs: total training length (defines the target profile).
+        sigma_rel_target: target sigma_rel to synthesize (e.g. ``0.15``).
+
+    Returns:
+        dict with keys:
+            ``'epochs'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'basis'``: list of ``(checkpoint_epoch, sigma_rel, weights)`` tuples
+            ``'target'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'synthesized'``: ``np.ndarray`` of shape ``(total_epochs,)``
+            ``'coefficients'``: ``np.ndarray`` of shape ``(n_basis,)``
+    """
+    from scipy.optimize import nnls
+
+    epochs = np.arange(1, total_epochs + 1)
+    gammas_train = [gamma_from_sigma_rel(s) for s in sigma_rels_train]
+    gamma_target = gamma_from_sigma_rel(sigma_rel_target)
+
+    basis = []
+    for t_i in checkpoint_epochs:
+        for gamma_j, s_j in zip(gammas_train, sigma_rels_train):
+            w = np.where(epochs <= t_i, (epochs / t_i) ** gamma_j, 0.0)
+            if w.sum() > 0:
+                w = w / w.sum()
+            basis.append((t_i, s_j, w))
+
+    w_target = (epochs / total_epochs) ** gamma_target
+    w_target = w_target / w_target.sum()
+
+    B = np.column_stack([w for _, _, w in basis])
+    coeffs, _ = nnls(B, w_target)
+    if coeffs.sum() > 0:
+        coeffs = coeffs / coeffs.sum()
+    w_synth = B @ coeffs
+
+    return {
+        'epochs': epochs,
+        'basis': basis,
+        'target': w_target,
+        'synthesized': w_synth,
+        'coefficients': coeffs,
+    }
+
+
+def synthesize_ema_from_checkpoints(
+    model: torch.nn.Module,
+    output_dir: str,
+    sigma_rel_target: float,
+    sigma_rels: Optional[tuple] = None,
+    up_to_epoch: Optional[int] = None,
+) -> torch.nn.Module:
+    """Synthesize a post-hoc EMA model by pooling snapshots across checkpoints.
+
+    Gathers all ``.pt`` EMA snapshot files from every ``checkpoint-epoch-*/ema/``
+    subdirectory in ``output_dir`` into a single temporary directory (via
+    symlinks) and delegates synthesis to ``PostHocEMA``.
+
+    ``sigma_rels`` is read automatically from ``checkpoint_config.yaml`` if not
+    supplied explicitly.
+
+    Args:
+        model: the nn.Module used during training (needed for parameter structure).
+        output_dir: root training directory containing ``checkpoint-epoch-*`` dirs.
+        sigma_rel_target: target EMA profile to synthesize, e.g. ``0.15``.
+        sigma_rels: sigma_rel values used during training, e.g. ``(0.05, 0.28)``.
+            If ``None``, read from the latest checkpoint's ``checkpoint_config.yaml``.
+        up_to_epoch: if set, only use checkpoints at or before this epoch number.
+
+    Returns:
+        Synthesized nn.Module with EMA weights.
+    """
+    import tempfile
+    from pathlib import Path
+    from ema_pytorch import PostHocEMA
+
+    ckpt_dirs = sorted(Path(output_dir).glob('checkpoint-epoch-*'))
+    if up_to_epoch is not None:
+        ckpt_dirs = [d for d in ckpt_dirs if int(d.name.split('-')[-1]) <= up_to_epoch]
+
+    if not ckpt_dirs:
+        raise ValueError(f"No checkpoints found in {output_dir}")
+
+    if sigma_rels is None:
+        cfg_path = ckpt_dirs[-1] / 'checkpoint_config.yaml'
+        with open(cfg_path) as f:
+            ckpt_cfg = yaml.safe_load(f)
+        sigma_rels = ckpt_cfg.get('ema_sigma_rels')
+        if sigma_rels is None:
+            raise ValueError(
+                "sigma_rels not found in checkpoint_config.yaml — "
+                "pass sigma_rels explicitly or retrain with ema_sigma_rels set."
+            )
+        sigma_rels = tuple(sigma_rels)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        for ckpt_dir in ckpt_dirs:
+            for pt_file in (ckpt_dir / 'ema').glob('*.pt'):
+                (tmp_path / pt_file.name).symlink_to(pt_file.resolve())
+
+        ema = PostHocEMA(
+            model,
+            sigma_rels=sigma_rels,
+            checkpoint_folder=tmp_path,
+            checkpoint_every_num_steps='manual',
+        )
+        return ema.synthesize_ema_model(sigma_rel=sigma_rel_target)
+
+
+def load_ema_snapshot(
+    model: torch.nn.Module,
+    checkpoint_dir: str,
+    profile_index: int = 0,
+) -> torch.nn.Module:
+    """Load a single raw EMA snapshot into ``model`` in-place.
+
+    Reads the ``.pt`` snapshot file for the given training profile from
+    ``<checkpoint_dir>/ema/`` and copies its weights into ``model`` (no
+    synthesis, no pooling across checkpoints).
+
+    Use this when you want exactly the EMA at one of the trained ``sigma_rels``
+    captured at one specific epoch.  For arbitrary target ``sigma_rel`` values
+    or for pooling across many checkpoints, use
+    :func:`synthesize_ema_from_checkpoints` instead.
+
+    Args:
+        model: the nn.Module to load weights into; modified in place and returned.
+        checkpoint_dir: a ``checkpoint-epoch-XXXX`` directory containing an
+            ``ema/`` subdirectory.
+        profile_index: which trained profile to load — ``0`` for
+            ``sigma_rels[0]`` (e.g. 0.05), ``1`` for ``sigma_rels[1]``
+            (e.g. 0.28).  Defaults to ``0``.
+
+    Returns:
+        The same ``model``, with EMA weights loaded.
+    """
+    from pathlib import Path
+
+    ema_dir = Path(checkpoint_dir) / 'ema'
+    pt_files = sorted(ema_dir.glob(f'{profile_index}.*.pt'))
+    if not pt_files:
+        raise ValueError(
+            f"No EMA snapshots for profile {profile_index} in {ema_dir}"
+        )
+    # filename format is {profile_index}.{global_step}.pt — pick the latest step
+    pt_file = max(pt_files, key=lambda p: int(p.stem.split('.')[1]))
+
+    snap = torch.load(pt_file, map_location='cpu', weights_only=False)
+    ema_state = {
+        k[len('ema_model.'):]: v
+        for k, v in snap.items()
+        if k.startswith('ema_model.')
+    }
+    model.load_state_dict(ema_state)
+    return model
 
 
 class PCAEncoder(torch.nn.Module):

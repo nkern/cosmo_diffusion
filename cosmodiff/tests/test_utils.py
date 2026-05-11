@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import numpy as np
@@ -5,14 +6,22 @@ import torch
 from cosmodiff.utils import (
     ArrayDataset,
     load_data,
-    minmax_norm,
-    center_scale_norm,
     npy_read_fn,
+    txt_read_fn,
     parse_config_model,
     parse_config_data,
+    read_config,
     write_metrics,
     read_metrics,
 )
+from cosmodiff.transform import Normalization, MultiNormalization, Transform, MultiTransform
+from cosmodiff.data import DATA_PATH
+
+CONFIG_PATH = DATA_PATH / 'config.yaml'
+SIM_PATH = DATA_PATH / 'IllustrisTNG_Mcdm.npy'
+PARAMS_PATH = DATA_PATH / 'params_Illustris.txt'
+# shape: (34, 32, 32, 32), dtype: float32
+DATA_N, DATA_NZ, DATA_NX, DATA_NY = 34, 32, 32, 32
 
 
 def _make_array(n=20, nz=4, nx=8, ny=8):
@@ -24,16 +33,14 @@ def _make_array(n=20, nz=4, nx=8, ny=8):
 # ---------------------------------------------------------------------------
 
 def test_n_samples():
-    arr = _make_array(n=20)
-    images, _ = load_data(arr, img_read_fn=None, norm=None, two_dim=False)
-    assert images.shape[0] == 20
+    images_all = load_data(SIM_PATH, img_read_fn=npy_read_fn, normalization=None, reshape="3d")['images']
+    assert images_all.shape[0] == DATA_N
 
-    images, _ = load_data(arr, img_read_fn=None, n_samples=7, norm=None, two_dim=False)
-    assert images.shape[0] == 7
+    images_sub = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, normalization=None, reshape="3d")['images']
+    assert images_sub.shape[0] == 3
 
-    arr_t = torch.as_tensor(arr)
-    for i in range(len(images)):
-        assert any(torch.allclose(images[i], arr_t[j]) for j in range(len(arr_t)))
+    for i in range(len(images_sub)):
+        assert any(torch.allclose(images_sub[i], images_all[j]) for j in range(len(images_all)))
 
 
 def test_n_samples_labels_in_sync():
@@ -43,12 +50,13 @@ def test_n_samples_labels_in_sync():
     # labels encode each sample's original row index so we can verify alignment
     labels = np.arange(20)
 
-    images, out_labels = load_data(
+    out = load_data(
         arr, img_read_fn=None,
         label_path=labels, label_read_fn=None,
         n_samples=7, seed=0,
-        norm=None, two_dim=False,
+        normalization=None, reshape="3d",
     )
+    images, out_labels = out['images'], out['labels']
     assert images.shape[0] == 7
     assert out_labels.shape[0] == 7
 
@@ -59,23 +67,110 @@ def test_n_samples_labels_in_sync():
 
 
 def test_seed():
-    arr = _make_array(n=50)
-    imgs1, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
-    imgs2, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=42, norm=None, two_dim=False)
-    imgs3, _ = load_data(arr, img_read_fn=None, n_samples=10, seed=99, norm=None, two_dim=False)
+    imgs1 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, reshape="3d")['images']
+    imgs2 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=42, normalization=None, reshape="3d")['images']
+    imgs3 = load_data(SIM_PATH, img_read_fn=npy_read_fn, n_samples=3, seed=99, normalization=None, reshape="3d")['images']
     assert torch.allclose(imgs1, imgs2)
     assert not torch.allclose(imgs1, imgs3)
 
 
 def test_memmap():
-    arr = _make_array(n=10)
-    with tempfile.NamedTemporaryFile(suffix=".npy") as f:
-        np.save(f.name, arr)
-        mmap = np.load(f.name, mmap_mode="r")
-        images_all, _ = load_data(mmap, img_read_fn=None, norm=None, two_dim=False)
-        images_sub, _ = load_data(mmap, img_read_fn=None, n_samples=5, norm=None, two_dim=False)
-    assert images_all.shape[0] == 10
-    assert images_sub.shape[0] == 5
+    mmap = np.load(SIM_PATH, mmap_mode="r")
+    images_all = load_data(mmap, img_read_fn=None, normalization=None, reshape="3d")['images']
+    images_sub = load_data(mmap, img_read_fn=None, n_samples=3, normalization=None, reshape="3d")['images']
+    assert images_all.shape[0] == DATA_N
+    assert images_sub.shape[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# load_data: multi-path returns the right (Multi)Normalization / (Multi)Transform
+# ---------------------------------------------------------------------------
+
+def test_load_data_multipath_norm_transform_types():
+    """Two img_paths + two label_paths exercising the two normalization modes.
+
+    Mode A — single normalization / transform shared across all paths
+        → ``out['norm']`` is :class:`Normalization`
+        → ``out['tform']`` is :class:`Transform`
+
+    Mode B — list-shaped normalization / transform (one per path)
+        → ``out['norm']`` is :class:`MultiNormalization`
+        → ``out['tform']`` is :class:`MultiTransform`
+    """
+    img_paths = [str(SIM_PATH), str(SIM_PATH)]
+    label_paths = [str(PARAMS_PATH), str(PARAMS_PATH)]
+
+    # --- Case (i): scalar normalization / transform ---
+    out_a = load_data(
+        img_path=img_paths,
+        img_read_fn=npy_read_fn,
+        label_path=label_paths,
+        label_read_fn=txt_read_fn,
+        reshape='2d',
+        zthin=4,
+        normalization='min-max',
+        transform=['log'],
+    )
+    assert isinstance(out_a['norm'], Normalization)
+    assert not isinstance(out_a['norm'], MultiNormalization)
+    assert isinstance(out_a['tform'], Transform)
+    assert not isinstance(out_a['tform'], MultiTransform)
+
+    # --- Case (ii): per-path normalization / transform ---
+    out_b = load_data(
+        img_path=img_paths,
+        img_read_fn=npy_read_fn,
+        label_path=label_paths,
+        label_read_fn=txt_read_fn,
+        reshape='2d',
+        zthin=4,
+        normalization=['min-max', 'min-max'],
+        norm_kwargs=[{}, {}],
+        transform=[['log'], ['log']],
+    )
+    assert isinstance(out_b['norm'], MultiNormalization)
+    assert isinstance(out_b['tform'], MultiTransform)
+
+
+def test_load_data_log_fft2_transform_roundtrip():
+    """``transform=['log', 'fft2']`` via load_data round-trips back to the
+    raw input under tform.inverse.
+
+    Exercises the full config-style path: ``load_data`` parses the list,
+    extracts ``log`` as a flag, constructs the :class:`Transform`, applies
+    it to the loaded images, and stores the fitted object in ``out['tform']``.
+    Calling ``.inverse()`` on the loaded images recovers the post-reshape
+    raw images within floating-point tolerance.
+    """
+    # synthetic O(1)-magnitude positive data so log() and the FFT round-trip
+    # don't accumulate magnitude-related FP error (cosmology data sits near
+    # 1e10 which exceeds float32 round-trip precision)
+    rng = np.random.default_rng(0)
+    arr = rng.random((4, 8, 16, 16)).astype(np.float32) + 0.1
+
+    out_raw = load_data(
+        img_path=arr,
+        img_read_fn=None,
+        reshape='2d',
+        zthin=2,
+        normalization=None,
+        transform=None,
+    )
+    out_tf = load_data(
+        img_path=arr,
+        img_read_fn=None,
+        reshape='2d',
+        zthin=2,
+        normalization=None,
+        transform=['log', 'fft2'],
+    )
+    assert isinstance(out_tf['tform'], Transform)
+    # forward doubled the channel dim via fft2 real|imag concat
+    assert out_tf['images'].shape[1] == out_raw['images'].shape[1] * 2
+    # inverse recovers the raw input
+    recovered = out_tf['tform'].inverse(out_tf['images'])
+    assert torch.allclose(recovered, out_raw['images'], atol=1e-5), \
+        f"max diff after log→fft2 roundtrip: {(recovered - out_raw['images']).abs().max()}"
 
 
 # ---------------------------------------------------------------------------
@@ -97,34 +192,13 @@ def test_array_dataset():
 
 
 # ---------------------------------------------------------------------------
-# minmax_norm / center_scale_norm
-# ---------------------------------------------------------------------------
-
-def test_minmax_norm():
-    x = torch.randn(4, 8, 8)
-    out = minmax_norm(x)
-    assert out.min().item() >= -1.0 - 1e-6
-    assert out.max().item() <= 1.0 + 1e-6
-
-
-def test_center_scale_norm():
-    x = torch.randn(100)
-    out = center_scale_norm(x.clone())
-    assert abs(out.mean().item()) < 0.1
-    assert out.abs().max().item() <= 1.0 + 1e-6
-
-
-# ---------------------------------------------------------------------------
 # npy_read_fn
 # ---------------------------------------------------------------------------
 
 def test_npy_read_fn():
-    arr = np.random.rand(5, 4, 8, 8).astype(np.float32)
-    with tempfile.NamedTemporaryFile(suffix=".npy") as f:
-        np.save(f.name, arr)
-        result = npy_read_fn(f.name)
-    assert result.shape == arr.shape
-    assert np.allclose(result, arr)
+    result = npy_read_fn(SIM_PATH)
+    assert result.shape == (DATA_N, DATA_NZ, DATA_NX, DATA_NY)
+    assert result.dtype == np.float32
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +237,11 @@ def test_parse_config_model():
         "noise_scheduler": {"class": "DDPMScheduler", "kwargs": {"num_train_timesteps": 10}},
         "lr_scheduler": {"class": "ConstantLR", "kwargs": {"factor": 1.0, "total_iters": 0}},
     }
-    model, optimizer, noise_scheduler, lr_scheduler = parse_config_model(config)
-    assert model is not None
-    assert optimizer is not None
-    assert noise_scheduler is not None
-    assert lr_scheduler is not None
+    out = parse_config_model(config)
+    assert out['model'] is not None
+    assert out['optimizer'] is not None
+    assert out['noise_scheduler'] is not None
+    assert out['lr_scheduler'] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -185,15 +259,79 @@ def test_parse_config_data():
         "data": {
             "img_path": img_path,
             "img_read_fn": "npy_read_fn",
-            "log": False,
-            "norm": "min-max",
-            "two_dim": True,
+            "normalization": "min-max",
+            "reshape": "2d",
             "zthin": 1,
             "keep_on_cpu": True,
         },
     }
-    dataset = parse_config_data(config)
+    out = parse_config_data(config)
+    dataset = out['data']
     assert len(dataset) == 6 * 4  # Nbatch * Nz slices
     item = dataset[0]
     assert "images" in item
     assert item["images"].shape == torch.Size([1, 8, 8])
+
+
+# ---------------------------------------------------------------------------
+# configs/config.yaml round-trip
+# ---------------------------------------------------------------------------
+
+def test_config_yaml_parse_model():
+    """parse_config_model must instantiate all four components from config.yaml."""
+    config = read_config(CONFIG_PATH)
+    config['global']['device'] = 'cpu'  # don't require GPU in CI
+
+    out = parse_config_model(config)
+    model = out['model']
+    optimizer = out['optimizer']
+    noise_scheduler = out['noise_scheduler']
+    lr_scheduler = out['lr_scheduler']
+
+    assert type(model).__name__ == 'UNet2DModel'
+    assert model.config.sample_size == 64
+    assert model.config.in_channels == 1
+    assert model.config.out_channels == 1
+
+    assert type(optimizer).__name__ == 'AdamW'
+    assert abs(optimizer.param_groups[0]['lr'] - 1e-4) < 1e-10
+    assert abs(optimizer.param_groups[0]['weight_decay'] - 1e-2) < 1e-10
+
+    assert type(noise_scheduler).__name__ == 'DDPMScheduler'
+    assert noise_scheduler.config.num_train_timesteps == 1000
+
+    assert type(lr_scheduler).__name__ == 'ConstantLR'
+
+
+def test_config_yaml_parse_data():
+    """parse_config_data must build an ArrayDataset with the right shape,
+    normalization, and augmentation pipeline from config.yaml."""
+    from cosmodiff.augment import RandomRoll, RandomFlip
+
+    config = read_config(CONFIG_PATH)
+    config['global']['device'] = 'cpu'
+
+    cfg = copy.deepcopy(config)
+    cfg['data']['img_path'] = str(SIM_PATH)
+    cfg['data']['label_path'] = None
+    cfg['data']['keep_on_cpu'] = True
+    cfg['data']['transform'] = None  # this test checks raw shape, not transform behavior
+
+    out = parse_config_data(cfg)
+    dataset = out['data']
+    norm = out['norm']
+
+    zthin = config['data']['zthin']
+    assert isinstance(dataset, ArrayDataset)
+    assert len(dataset) == DATA_N * (DATA_NZ // zthin)
+    item = dataset[0]
+    assert 'images' in item
+    assert item['images'].shape == torch.Size([1, DATA_NX, DATA_NY])
+
+    assert isinstance(norm, Normalization)
+    assert norm.method == config['data']['normalization']
+
+    assert dataset.augmentations is not None
+    aug_types = [type(t) for t in dataset.augmentations]
+    assert RandomRoll in aug_types
+    assert RandomFlip in aug_types

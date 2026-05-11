@@ -12,7 +12,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Intended Audience :: Science/Research",
 ]
-dynamic = ["version"]
+version = "0.0.1"
 
 [project.optional-dependencies]
 dev = [
@@ -29,6 +29,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "coverage",
+    "ema-pytorch",
 ]
 docs = [
     "cosmodiff[dev]",
@@ -48,5 +49,12 @@ testpaths = 'cosmodiff/tests'
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools]
-script-files = ["scripts/cosmodiff_train.py"]
+script-files = ["scripts/cosmodiff_train.py", "scripts/cosmodiff_sample.py"]
+
+[tool.setuptools.packages.find]
+include = ["cosmodiff*"]
+exclude = ["cosmodiff.tests*"]
+
+[tool.setuptools.package-data]
+"cosmodiff.data" = ["*.npy", "*.yaml", "*.txt"]
 
