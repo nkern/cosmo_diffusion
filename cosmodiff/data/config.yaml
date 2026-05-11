@@ -27,7 +27,7 @@ data:
     alpha: null
     beta: null
   transform:
-    [log, rfft2]
+    [log, fft2]
 
 # --- augmentations ---
 augmentations:

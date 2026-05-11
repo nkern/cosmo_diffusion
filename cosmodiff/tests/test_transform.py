@@ -182,9 +182,9 @@ def test_transform_log_roundtrip():
     assert torch.allclose(x_back, x, atol=1e-5)
 
 
-def test_transform_rfft2_shape_and_roundtrip():
-    """rfft2 op doubles the channel dim (real|imag) and round-trips back."""
-    t = Transform(ops=['rfft2'], log=False)
+def test_transform_fft2_shape_and_roundtrip():
+    """fft2 op doubles the channel dim (real|imag) and round-trips back."""
+    t = Transform(ops=['fft2'], log=False)
     x = torch.randn(3, 2, 8, 8)
     y = t(x)
     # real and imaginary parts concatenated along channel dim
@@ -194,9 +194,9 @@ def test_transform_rfft2_shape_and_roundtrip():
     assert torch.allclose(x_back, x, atol=1e-5)
 
 
-def test_transform_log_then_rfft2_roundtrip():
-    """log → rfft2 forward; ifft2 → exp inverse round-trips."""
-    t = Transform(ops=['rfft2'], log=True)
+def test_transform_log_then_fft2_roundtrip():
+    """log → fft2 forward; ifft2 → exp inverse round-trips."""
+    t = Transform(ops=['fft2'], log=True)
     x = torch.rand(2, 1, 8, 8) + 0.5  # strictly positive so log is well-defined
     y = t(x)
     assert y.shape == (2, 2, 8, 8)

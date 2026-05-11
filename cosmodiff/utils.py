@@ -113,7 +113,7 @@ def load_data(
         normalization (str): Normalize image pixel distribution.
             ['min-max', 'center-max']
         norm_kwargs: kwargs for pixel normalization function
-        transform (list): list of data transforms e.g. ['log', 'rfft2'].
+        transform (list): list of data transforms e.g. ['log', 'fft2'].
             Ordered by operation. Note that 'log' always happens first if included.
         read_only (bool): if True, only read the data from disk
             to numpy array and return (no transform or normalization)
@@ -224,7 +224,7 @@ def load_data(
 
             # modify transform to be list of list if needed
             if transform is not None:
-                # transform is either ['log', 'rfft2'] or [['log'], None, ['log', 'rfft2']]
+                # transform is either ['log', 'fft2'] or [['log'], None, ['log', 'fft2']]
                 if isinstance(transform[0], str):
                     transform = [transform] * n
 

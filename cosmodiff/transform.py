@@ -199,6 +199,9 @@ class Normalization(torch.nn.Module):
 
         return x
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(method={self.method})"
+
 
 class MultiNormalization(torch.nn.Module):
     """
@@ -237,8 +240,10 @@ class Transform(torch.nn.Module):
         ops (list of str, optional): ordered list of operation names to apply
             after the log step.  Currently supported:
 
-            * ``'rfft2'``: 2D FFT; real and imaginary parts are concatenated
+            * ``'fft2'``: 2D FFT; real and imaginary parts are concatenated
               along the channel dimension to keep the tensor real-valued.
+              Actually uses fft2 so that we don't change size of image.
+              But negative frequencies are discarded upon ifft2.
 
             Defaults to an empty pipeline if ``None``.
         log (bool): if ``True``, take ``log()`` before any ``ops`` (and
@@ -269,7 +274,7 @@ class Transform(torch.nn.Module):
 
         # now perform other operations
         for op in self.ops:
-            if op == 'rfft2':
+            if op == 'fft2':
                 x = torch.fft.fft2(x)
                 x = torch.cat([x.real, x.imag], dim=1)
 
@@ -284,7 +289,7 @@ class Transform(torch.nn.Module):
 
         # go through operations in reverse order
         for op in self.ops[::-1]:
-            if op == 'rfft2':
+            if op == 'fft2':
                 N = x.shape[1]//2
                 x = torch.complex(x[:, :N], x[:, N:])
                 x = torch.fft.ifft2(x).real
@@ -297,6 +302,9 @@ class Transform(torch.nn.Module):
             x.exp_()
 
         return x
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(ops={self.ops})"
 
 
 class MultiTransform(torch.nn.Module):

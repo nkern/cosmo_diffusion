@@ -132,6 +132,47 @@ def test_load_data_multipath_norm_transform_types():
     assert isinstance(out_b['tform'], MultiTransform)
 
 
+def test_load_data_log_fft2_transform_roundtrip():
+    """``transform=['log', 'fft2']`` via load_data round-trips back to the
+    raw input under tform.inverse.
+
+    Exercises the full config-style path: ``load_data`` parses the list,
+    extracts ``log`` as a flag, constructs the :class:`Transform`, applies
+    it to the loaded images, and stores the fitted object in ``out['tform']``.
+    Calling ``.inverse()`` on the loaded images recovers the post-reshape
+    raw images within floating-point tolerance.
+    """
+    # synthetic O(1)-magnitude positive data so log() and the FFT round-trip
+    # don't accumulate magnitude-related FP error (cosmology data sits near
+    # 1e10 which exceeds float32 round-trip precision)
+    rng = np.random.default_rng(0)
+    arr = rng.random((4, 8, 16, 16)).astype(np.float32) + 0.1
+
+    out_raw = load_data(
+        img_path=arr,
+        img_read_fn=None,
+        reshape='2d',
+        zthin=2,
+        normalization=None,
+        transform=None,
+    )
+    out_tf = load_data(
+        img_path=arr,
+        img_read_fn=None,
+        reshape='2d',
+        zthin=2,
+        normalization=None,
+        transform=['log', 'fft2'],
+    )
+    assert isinstance(out_tf['tform'], Transform)
+    # forward doubled the channel dim via fft2 real|imag concat
+    assert out_tf['images'].shape[1] == out_raw['images'].shape[1] * 2
+    # inverse recovers the raw input
+    recovered = out_tf['tform'].inverse(out_tf['images'])
+    assert torch.allclose(recovered, out_raw['images'], atol=1e-5), \
+        f"max diff after log→fft2 roundtrip: {(recovered - out_raw['images']).abs().max()}"
+
+
 # ---------------------------------------------------------------------------
 # ArrayDataset
 # ---------------------------------------------------------------------------
