@@ -69,8 +69,8 @@ class RandomFlip(nn.Module):
     """
     def __init__(self, dims=(-2, -1), p=0.5):
         super().__init__()
-        self.dims = list(dims)
-        self.p = p
+        self.dims = tuple(dims)
+        self.p = float(p)
 
     def __call__(self, x):
         if x is None:
@@ -81,6 +81,70 @@ class RandomFlip(nn.Module):
             return x
         else:
             return torch.flip(x, [self.dims[f] for f in flip])
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(dims={self.dims}, p={self.p})"
+
+
+class RandomRot90(nn.Module):
+    """Randomly rotate a tensor by a multiple of 90 degrees.
+
+    Args:
+        dims (tuple of int): Two dimensions defining the rotation plane.
+            Defaults to ``(-2, -1)``.
+        p (float): Probability of applying a random rotation. Defaults to ``1.0``.
+    """
+    def __init__(self, dims=(-2, -1), p=1.0):
+        super().__init__()
+        self.dims = tuple(dims)
+        if len(self.dims) != 2:
+            raise ValueError("RandomRot90 requires exactly two dims.")
+        self.p = float(p)
+
+    def __call__(self, x):
+        if x is None:
+            return None
+        if self.p <= 0.0:
+            return x
+        if self.p < 1.0 and torch.rand((), device='cpu').item() >= self.p:
+            return x
+        k = torch.randint(0, 4, (1,), device='cpu').item()
+        return torch.rot90(x, k, dims=self.dims)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(dims={self.dims}, p={self.p})"
+
+
+class RandomDihedral2D(nn.Module):
+    """Randomly apply one of the eight square symmetries to two dimensions.
+
+    This combines a random 90-degree rotation with an optional flip, which is
+    useful for isotropic 2D fields where orientation should not matter.
+
+    Args:
+        dims (tuple of int): Two image dimensions to transform.
+            Defaults to ``(-2, -1)``.
+        p (float): Probability of applying the augmentation. Defaults to ``1.0``.
+    """
+    def __init__(self, dims=(-2, -1), p=1.0):
+        super().__init__()
+        self.dims = tuple(dims)
+        if len(self.dims) != 2:
+            raise ValueError("RandomDihedral2D requires exactly two dims.")
+        self.p = float(p)
+
+    def __call__(self, x):
+        if x is None:
+            return None
+        if self.p <= 0.0:
+            return x
+        if self.p < 1.0 and torch.rand((), device='cpu').item() >= self.p:
+            return x
+        k = torch.randint(0, 4, (1,), device='cpu').item()
+        x = torch.rot90(x, k, dims=self.dims)
+        if torch.rand((), device='cpu').item() < 0.5:
+            x = torch.flip(x, [self.dims[0]])
+        return x
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(dims={self.dims}, p={self.p})"
@@ -122,4 +186,3 @@ def config_augmentations(augmentations):
         pipeline.append(getattr(augment, name)(**kwargs))
 
     return nn.Sequential(*pipeline)
-

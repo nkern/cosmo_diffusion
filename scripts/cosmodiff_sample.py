@@ -277,6 +277,8 @@ def main():
         model = synthesize_ema_from_checkpoints(
             model, checkpoints_dir, sigma_rel_target=ema_sigma_rel,
         )
+        if hasattr(model, "ema_model"):
+            model = model.ema_model
         model = model.to(device)
         model.eval()
 
