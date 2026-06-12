@@ -7,7 +7,9 @@ from diffusers import (
     UNet2DConditionModel,
     DDPMScheduler,
     DDIMScheduler,
+    DPMSolverMultistepScheduler,
     EulerDiscreteScheduler,
+    HeunDiscreteScheduler,
     DiTTransformer2DModel,
     PixArtTransformer2DModel,
     FlowMatchEulerDiscreteScheduler,
@@ -239,6 +241,36 @@ def test_generate_num_steps():
     model = _make_unet()
     scheduler = DDIMScheduler(num_train_timesteps=10)
     images = generate(model, scheduler, batch_size=2, image_shape=(1, 8, 8), num_steps=5)
+
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_dpm_solver_drops_unsupported_generator_kwarg():
+    """generate() works with solver schedulers whose step() lacks generator."""
+    model = _make_unet()
+    scheduler = DPMSolverMultistepScheduler(num_train_timesteps=10)
+    generator = torch.Generator().manual_seed(0)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8),
+        num_steps=5, generator=generator,
+    )
+
+    assert images.shape == (2, 1, 8, 8)
+    assert torch.isfinite(images).all()
+
+
+def test_generate_heun_drops_unsupported_generator_kwarg():
+    """generate() works with HeunDiscreteScheduler and a reproducible RNG."""
+    model = _make_unet()
+    scheduler = HeunDiscreteScheduler(num_train_timesteps=10)
+    generator = torch.Generator().manual_seed(0)
+    images = generate(
+        model, scheduler,
+        batch_size=2, image_shape=(1, 8, 8),
+        num_steps=5, generator=generator,
+    )
 
     assert images.shape == (2, 1, 8, 8)
     assert torch.isfinite(images).all()

@@ -746,6 +746,8 @@ def generate(
         )
         if v is not None and k in step_supported
     }
+    if generator is not None and 'generator' in step_supported:
+        step_kwargs['generator'] = generator
 
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
         # FM schedulers use float timesteps; DDPM-family use int — preserve dtype.
@@ -773,7 +775,7 @@ def generate(
             pred = model(images_input, timesteps, return_dict=False)[0]
 
         images = noise_scheduler.step(
-            pred, t, images, generator=generator, **step_kwargs,
+            pred, t, images, **step_kwargs,
         ).prev_sample
 
     if renorm is not None:
@@ -921,7 +923,10 @@ def synthesize_ema_from_checkpoints(
         tmp_path = Path(tmp_dir)
         for ckpt_dir in ckpt_dirs:
             for pt_file in (ckpt_dir / 'ema').glob('*.pt'):
-                (tmp_path / pt_file.name).symlink_to(pt_file.resolve())
+                link_path = tmp_path / pt_file.name
+                if link_path.exists():
+                    continue
+                link_path.symlink_to(pt_file.resolve())
 
         ema = PostHocEMA(
             model,
