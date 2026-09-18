@@ -79,6 +79,48 @@ cosmodiff_sample.py --config path/to/config.yaml \
     --num_steps 25
 ```
 
+## Fresh DiT zero initialization
+
+To opt a new DiT training run into zero modulation/output initialization, add
+`initialization: adaln_zero` alongside `class` and `kwargs` in the model config:
+
+```yaml
+model:
+  class: DiTTransformer2DModel
+  initialization: adaln_zero
+  kwargs:
+    sample_size: 128
+    patch_size: 8
+    in_channels: 1
+    out_channels: 1
+    num_layers: 16
+    num_attention_heads: 12
+    attention_head_dim: 64
+    num_embeds_ada_norm: 1000
+    norm_type: ada_norm_zero
+```
+
+Keep the architecture arguments appropriate for your run; the policy does not
+change them. It zeroes the weight and bias of every block's `norm1.linear`
+(attention/FFN shifts, scales, and residual gates), plus `proj_out_1` (final
+conditioning) and `proj_out_2` (prediction head). Initially, the blocks are
+identity mappings and the denoising prediction is zero; these values are not
+frozen and training learns them. Attention, FFN, and embedding weights retain
+their native initialization.
+
+This implements the zero-modulation/output part of
+[Peebles and Xie's DiT initialization](https://arxiv.org/abs/2212.09748), not
+the complete reference initialization or training recipe. Omitted
+`initialization`, or `initialization: native`, preserves existing behavior.
+Only native `DiTTransformer2DModel` with `norm_type: ada_norm_zero` is supported;
+incompatible projection APIs fail before any weights are zeroed. This policy
+was checked with diffusers 0.38.0 without imposing a version pin.
+
+Initialization is applied only when constructing a fresh model. Resuming or
+sampling a checkpoint does **not** zero its trained weights. Enabling this
+option does not retrofit an already-trained checkpoint or guarantee improved
+generation for every dataset or model depth.
+
 ## Authors
 
 - Nicholas Kern

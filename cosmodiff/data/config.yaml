@@ -41,6 +41,7 @@ augmentations:
 # --- model ---
 model:
   class: UNet2DModel
+  initialization: native      # DiT only: 'adaln_zero' opts in to fresh zero modulation/output init
   kwargs:
     sample_size: 64
     in_channels: 1

@@ -458,6 +458,12 @@ def parse_config_model(config: dict):
     parsed yaml config dict. Any missing keys return ``None``, which will
     trigger the corresponding default in ``train()``.
 
+    ``model.initialization`` defaults to ``"native"`` (unchanged diffusers
+    initialization). ``"adaln_zero"`` opts a fresh ``DiTTransformer2DModel``
+    into zero modulation/output initialization before the optimizer is built.
+    Checkpoint loading and the training script's resume path do not use this
+    fresh-model factory and never reapply initialization.
+
     Args:
         config (dict): Parsed yaml config, e.g. from ``yaml.safe_load()``.
 
@@ -486,8 +492,17 @@ def parse_config_model(config: dict):
     # --- model ----------------------------------------------------------
     model = None
     if "model" in config:
+        initialization = config["model"].get("initialization", "native")
+        if initialization not in ("native", "adaln_zero"):
+            raise ValueError("model.initialization must be 'native' or 'adaln_zero'")
+        if (initialization == "adaln_zero"
+                and config["model"]["class"] != "DiTTransformer2DModel"):
+            raise ValueError("model.initialization='adaln_zero' requires DiTTransformer2DModel")
         model_cls = getattr(diffusers, config["model"]["class"])
         model = model_cls(**config["model"].get("kwargs", {}))
+        if initialization == "adaln_zero":
+            from .initialization import initialize_dit_adaln_zero
+            initialize_dit_adaln_zero(model, fresh=True)
         model.to(device)
 
     # --- optimizer ------------------------------------------------------
