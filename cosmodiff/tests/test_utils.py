@@ -85,6 +85,37 @@ def test_minmax_norm():
     assert out.max().item() <= 1.0 + 1e-6
 
 
+def test_load_data_quantile_minmax():
+    arr = np.linspace(1.0, 101.0, 101, dtype=np.float32).reshape(1, 1, 1, 101)
+    images, _ = load_data(
+        arr,
+        img_read_fn=None,
+        minmax=False,
+        normalization="quantile_minmax",
+        norm_kwargs={"q_low": 0, "q_high": 90},
+        two_dim=False,
+    )
+    assert images.min().item() >= -1.0 - 1e-6
+    assert images.max().item() <= 1.0 + 1e-6
+    assert torch.isclose(images.flatten()[0], torch.tensor(-1.0))
+    assert torch.isclose(images.flatten()[-1], torch.tensor(1.0))
+
+
+def test_load_data_centered_maxabs():
+    arr = np.array([1.0, 2.0, 4.0, 9.0], dtype=np.float32).reshape(1, 1, 2, 2)
+    images, _ = load_data(
+        arr,
+        img_read_fn=None,
+        minmax=False,
+        normalization="centered_maxabs",
+        two_dim=False,
+    )
+    assert abs(images.mean().item()) < 1e-6
+    assert images.min().item() >= -1.0 - 1e-6
+    assert images.max().item() <= 1.0 + 1e-6
+    assert torch.isclose(images.abs().max(), torch.tensor(1.0))
+
+
 def test_center_scale_norm():
     x = torch.randn(100)
     out, avg, std = center_scale_norm(x.clone(), scale=10)

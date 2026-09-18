@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ConstantLR
 from accelerate import Accelerator
-from diffusers import AutoModel, DDPMScheduler
+from diffusers import DDPMScheduler
 from tqdm.auto import tqdm
 from typing import Callable, Optional
 import time
@@ -33,6 +33,7 @@ def train(
     force_cpu: bool = False,
     pin_memory: bool = False,
     verbose: bool = True,
+    start_epoch: int = 0,
 ):
     """Train a diffusers diffusion model.
 
@@ -174,7 +175,7 @@ def train(
         "epoch_lr": [],
     }
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         progress = tqdm(
             dataloader,
             desc=f"Epoch {epoch}/{num_epochs - 1}",

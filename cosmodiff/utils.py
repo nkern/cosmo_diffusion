@@ -1,6 +1,7 @@
 import os
 import glob
 import pickle
+import inspect
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,7 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import ConstantLR
 from accelerate import Accelerator
 import diffusers
-from diffusers import AutoModel, DDPMScheduler
+from diffusers import DDPMScheduler
 from tqdm.auto import tqdm
 import time
 import yaml
@@ -68,6 +69,8 @@ def load_data(
     label_read_fn: Optional[callable] = None,
     log: bool = False,
     minmax: bool = True,
+    normalization: str | None = None,
+    norm_kwargs: dict | None = None,
     two_dim: bool = True,
     zthin: int = 1,
     n_samples: int | None = None,
@@ -108,7 +111,16 @@ def load_data(
         log (bool): Apply a log transform to images before normalization.
             Defaults to ``False``.
         minmax (bool): Normalize images to ``[-1, 1]`` via min-max scaling.
-            Defaults to ``True``.
+            Defaults to ``True``. Kept for backward compatibility; prefer
+            ``normalization`` for new configs.
+        normalization (str, optional): Normalization mode. ``None`` preserves
+            the legacy behavior from ``minmax``. Supported values are
+            ``"none"``, ``"minmax"``, ``"centered_maxabs"``, and
+            ``"quantile_minmax"``.
+        norm_kwargs (dict, optional): Extra parameters for ``normalization``.
+            ``centered_maxabs`` accepts ``center`` (``"mean"`` or
+            ``"median"``). ``quantile_minmax`` accepts ``q_low`` and
+            ``q_high`` percentiles.
         two_dim (bool): If ``True``, reshape the data to treat each z-slice
             as an independent 2D image. If ``False``, treat each sample as a
             3D volume. Defaults to ``True``.
@@ -154,6 +166,9 @@ def load_data(
         # images may be a memory-mapped array, so slice to instantiate it
         images = images[:]
 
+    if isinstance(images, np.ndarray) and not images.flags.writeable:
+        images = np.array(images, copy=True)
+
     images = torch.as_tensor(images, device=device, dtype=dtype)
 
     # --- labels ---------------------------------------------------------
@@ -174,9 +189,60 @@ def load_data(
     if log:
         images = images.log()
 
-    if minmax:
+    if normalization is None:
+        normalization = "minmax" if minmax else "none"
+
+    norm_kwargs = norm_kwargs or {}
+    normalization = str(normalization).lower()
+
+    if normalization in ("none", "false"):
+        pass
+    elif normalization == "minmax":
         images = images - images.min()
         images = images / images.max() * 2 - 1.0
+    elif normalization == "centered_maxabs":
+        center = str(norm_kwargs.get("center", "mean")).lower()
+        if center == "mean":
+            offset = images.mean()
+        elif center == "median":
+            offset = images.median()
+        else:
+            raise ValueError("centered_maxabs center must be 'mean' or 'median'.")
+
+        images = images - offset
+        scale = images.abs().max()
+        if not torch.isfinite(scale) or scale <= 0:
+            raise ValueError(f"Invalid centered_maxabs scale: {scale.item()}.")
+        images = images / scale
+    elif normalization == "quantile_minmax":
+        q_low = float(norm_kwargs.get("q_low", 0.001))
+        q_high = float(norm_kwargs.get("q_high", 99.99))
+        max_quantile_samples = int(norm_kwargs.get("max_quantile_samples", 2_000_000))
+        if not 0 <= q_low < q_high <= 100:
+            raise ValueError("quantile_minmax requires 0 <= q_low < q_high <= 100.")
+
+        quantiles = torch.tensor([q_low / 100.0, q_high / 100.0], device=images.device)
+        flat = images.flatten()
+        if max_quantile_samples > 0 and flat.numel() > max_quantile_samples:
+            stride = max(1, (flat.numel() + max_quantile_samples - 1) // max_quantile_samples)
+            flat_for_quantiles = flat[::stride][:max_quantile_samples]
+        else:
+            flat_for_quantiles = flat
+        flat_for_quantiles = flat_for_quantiles.detach().float().cpu()
+        lo, hi = torch.quantile(flat_for_quantiles, quantiles.cpu())
+        lo = lo.to(device=images.device, dtype=images.dtype)
+        hi = hi.to(device=images.device, dtype=images.dtype)
+        if not torch.isfinite(lo) or not torch.isfinite(hi) or hi <= lo:
+            raise ValueError(
+                f"Invalid quantile range for quantile_minmax: lo={lo.item()}, hi={hi.item()}."
+            )
+        images = (images - lo) / (hi - lo) * 2 - 1.0
+        images = images.clamp(-1.0, 1.0)
+    else:
+        raise ValueError(
+            f"Unknown normalization mode {normalization!r}. "
+            "Use 'none', 'minmax', 'centered_maxabs', or 'quantile_minmax'."
+        )
 
     # --- reshape --------------------------------------------------------
     if two_dim:
@@ -226,16 +292,34 @@ def load_checkpoint(ckpt_path: str):
             train(my_dataset, model, noise_scheduler=noise_scheduler,
                 optimizer=optimizer, lr_scheduler=lr_scheduler)
     """
-    model = AutoModel.from_pretrained(ckpt_path)
+    model = diffusers.UNet2DModel.from_pretrained(ckpt_path)
 
     with open(os.path.join(ckpt_path, "noise_scheduler.pkl"), "rb") as f:
         noise_scheduler = pickle.load(f)
 
     with open(os.path.join(ckpt_path, "optimizer.pkl"), "rb") as f:
-        optimizer = pickle.load(f)
+        saved_optimizer = pickle.load(f)
 
     with open(os.path.join(ckpt_path, "lr_scheduler.pkl"), "rb") as f:
         lr_scheduler = pickle.load(f)
+
+    # Rebind the saved optimizer state to the freshly loaded model parameters.
+    # The pickled optimizer object owns old parameter tensors from the pickle
+    # stream, not the new UNet parameters loaded above.
+    optimizer_cls = type(saved_optimizer)
+    optimizer_sig = inspect.signature(optimizer_cls.__init__)
+    optimizer_kwargs = {
+        key: value
+        for key, value in saved_optimizer.defaults.items()
+        if key in optimizer_sig.parameters
+    }
+    optimizer = optimizer_cls(model.parameters(), **optimizer_kwargs)
+    optimizer.load_state_dict(saved_optimizer.state_dict())
+
+    # The scheduler pickle also points to the old optimizer object.
+    # Keep its saved LR/epoch state, but point it at the rebuilt optimizer.
+    if hasattr(lr_scheduler, "optimizer"):
+        lr_scheduler.optimizer = optimizer
 
     augmentations_path = os.path.join(ckpt_path, "augmentations.pkl")
     if os.path.exists(augmentations_path):
@@ -381,6 +465,8 @@ def parse_config_data(config: dict):
         label_read_fn=label_read_fn,
         log=data_cfg.get("log", False),
         minmax=data_cfg.get("minmax", True),
+        normalization=data_cfg.get("normalization", None),
+        norm_kwargs=data_cfg.get("norm_kwargs", None),
         two_dim=data_cfg.get("two_dim", True),
         zthin=data_cfg.get("zthin", 1),
         n_samples=data_cfg.get("n_samples", None),
